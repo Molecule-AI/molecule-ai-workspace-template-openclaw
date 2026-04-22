@@ -2,25 +2,33 @@ name: OpenClaw Agent
 description: OpenClaw framework — multi-file prompt system with SOUL, BOOTSTRAP, AGENTS, TOOLS, and HEARTBEAT modules
 version: 1.0.0
 tier: 2
-
 runtime: openclaw
 model: openai:gpt-4.1-mini
-
 prompt_files:
-  - SOUL.md
-  - BOOTSTRAP.md
-  - AGENTS.md
-  - HEARTBEAT.md
-  - TOOLS.md
-  - USER.md
-
+- SOUL.md
+- BOOTSTRAP.md
+- AGENTS.md
+- HEARTBEAT.md
+- TOOLS.md
+- USER.md
 a2a:
   port: 8000
   streaming: true
   push_notifications: true
-
 env:
   required:
-    - OPENAI_API_KEY
-
+  - OPENAI_API_KEY
 template_schema_version: 1
+models:
+- id: openai:gpt-4.1-mini
+  name: GPT-4.1 Mini (OpenAI)
+  required_env:
+  - OPENAI_API_KEY
+- id: openai:gpt-4o
+  name: GPT-4o (OpenAI)
+  required_env:
+  - OPENAI_API_KEY
+- id: openai:o4-mini
+  name: o4-Mini (OpenAI)
+  required_env:
+  - OPENAI_API_KEY
