@@ -1,0 +1,20 @@
+name: publish-image
+
+# Builds this workspace template's Dockerfile and pushes it to GHCR as
+# `ghcr.io/molecule-ai/workspace-template-<runtime>:latest` + `:sha-<7>`.
+# The heavy lifting lives in the reusable workflow in molecule-ci —
+# change it there if the publish pattern needs to evolve.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    uses: Molecule-AI/molecule-ci/.github/workflows/publish-template-image.yml@main
+    secrets: inherit
