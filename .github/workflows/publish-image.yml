@@ -6,6 +6,12 @@ name: publish-image
 # change it there if the publish pattern needs to evolve.
 
 on:
+  # Re-publish when a new molecule-ai-workspace-runtime is released to
+  # PyPI. Sent by molecule-core's publish-runtime.yml `cascade` job via
+  # repository_dispatch with event-type "runtime-published".
+  # client_payload.runtime_version carries the new version string.
+  repository_dispatch:
+    types: [runtime-published]
   push:
     branches: [main]
   workflow_dispatch:
