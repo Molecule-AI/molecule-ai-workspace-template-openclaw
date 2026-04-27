@@ -16,7 +16,9 @@ WORKDIR /app
 # ARG changes the cache key for the pip install layer below — the
 # fix for the cascade cache trap that bit us 5x on 2026-04-27.
 ARG RUNTIME_VERSION=
- && \
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
       pip install --no-cache-dir --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
     fi
