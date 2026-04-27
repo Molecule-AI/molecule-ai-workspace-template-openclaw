@@ -2,8 +2,7 @@ name: publish-image
 
 # Builds this workspace template's Dockerfile and pushes it to GHCR as
 # `ghcr.io/molecule-ai/workspace-template-<runtime>:latest` + `:sha-<7>`.
-# The heavy lifting lives in the reusable workflow in molecule-ci —
-# change it there if the publish pattern needs to evolve.
+# The heavy lifting lives in the reusable workflow in molecule-ci.
 
 on:
   # Re-publish when a new molecule-ai-workspace-runtime is released to
@@ -15,6 +14,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      runtime_version:
+        description: "Optional explicit runtime version to bake in (forwarded as RUNTIME_VERSION build-arg)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -24,3 +28,9 @@ jobs:
   publish:
     uses: Molecule-AI/molecule-ci/.github/workflows/publish-template-image.yml@main
     secrets: inherit
+    with:
+      # Cascade fires with client_payload.runtime_version = the exact
+      # version PyPI just published. Forwarded as a docker --build-arg
+      # so the cache key changes per-version and pip install resolves
+      # freshly. Empty on push/PR — falls back to requirements.txt pin.
+      runtime_version: ${{ github.event.client_payload.runtime_version || inputs.runtime_version || '' }}
