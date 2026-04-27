@@ -241,3 +241,6 @@ class OpenClawA2AExecutor(AgentExecutor):
 
     async def cancel(self, context, event_queue):  # pragma: no cover
         pass
+
+
+Adapter = OpenClawAdapter
