@@ -193,12 +193,12 @@ class OpenClawA2AExecutor(AgentExecutor):
         self._heartbeat = heartbeat
 
     async def execute(self, context, event_queue):
-        from a2a.utils import new_agent_text_message
+        from a2a.helpers import new_text_message
 
         user_message = extract_message_text(context)
 
         if not user_message:
-            await event_queue.enqueue_event(new_agent_text_message("No message provided"))
+            await event_queue.enqueue_event(new_text_message("No message provided"))
             return
 
         await set_current_task(self._heartbeat, brief_task(user_message))
@@ -237,7 +237,7 @@ class OpenClawA2AExecutor(AgentExecutor):
         finally:
             await set_current_task(self._heartbeat, "")
 
-        await event_queue.enqueue_event(new_agent_text_message(reply))
+        await event_queue.enqueue_event(new_text_message(reply))
 
     async def cancel(self, context, event_queue):  # pragma: no cover
         pass
