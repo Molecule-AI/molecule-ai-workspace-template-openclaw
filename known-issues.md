@@ -132,3 +132,39 @@ Remove the `skills:` block from `config.yaml` to avoid confusion while this issu
 - Ticket: OWC-258
 
 ---
+
+## Issue 5 — `anthropic:` / `claude:` model strings silently routed to OpenAI
+
+**Severity:** High
+**First introduced:** v0.2.0 (initial routing table)
+**Components affected:** `adapter.py`
+
+### Symptom
+
+A workspace booted with the wheel-default model string `anthropic:claude-opus-4-7` (or any `anthropic:<id>` / `claude:<id>` configured by langchain/crewai consumers) reaches `running` status, the gateway becomes healthy, and the A2A handshake succeeds — but every subsequent inference call returns 401/404 from `api.openai.com`. The workspace looks fully online while being structurally unable to answer any question.
+
+### Root cause
+
+OpenClaw is OpenAI-compatible only — `--custom-compatibility` is hard-set to `openai`. The pre-fix prefix-routing table in `adapter.py` mapped every prefix it didn't recognise (including `anthropic` and `claude`) to `OPENAI_API_KEY` + `https://api.openai.com/v1`, then forwarded the bare model id (`claude-opus-4-7`) to the OpenAI endpoint. OpenAI doesn't host Claude models, so every call failed — but the failure surfaced as a per-message 401/404 instead of a boot-time error, so monitoring-by-status missed it.
+
+### Fix (PR landing on `fix/anthropic-prefix-route-via-openrouter`)
+
+`_resolve_provider_routing` (extracted as a pure helper in `adapter.py`) now detects `anthropic` / `claude` prefixes and re-routes through OpenRouter, which exposes Claude under the OpenAI-compat API at the slash-form id `anthropic/<id>`. The helper is exercised by `tests/test_model_routing.py` across all twelve routing branches. Per-prefix API-key lookup also lands so `groq:` / `openrouter:` / `qianfan:` use their proper env vars instead of the legacy fallthrough to `OPENAI_API_KEY`.
+
+### Current workaround (pre-fix workspaces)
+
+If you are pinned to a pre-fix template tag, set both env vars on the workspace:
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+export OPENCLAW_MODEL=openrouter:anthropic/claude-opus-4-7
+```
+
+The explicit `openrouter:` prefix avoids the broken anthropic-fallthrough path and matches the slash-form id OpenRouter expects.
+
+### Tracking
+
+- Filed: 2026-05-01
+- Ticket: OWC-272
+
+---

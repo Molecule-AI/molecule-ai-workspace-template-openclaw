@@ -28,6 +28,95 @@ OPENCLAW_PORT = 18789
 # Known missing optional deps in OpenClaw's npm package
 OPENCLAW_MISSING_DEPS = ["@buape/carbon", "@larksuiteoapi/node-sdk", "@slack/web-api", "grammy"]
 
+# Per-prefix API-key env var lookup. Each tuple is searched in order and
+# the first env var present wins, so an operator running multiple
+# providers can keep both keys set without one accidentally shadowing
+# the other.
+_API_KEY_BY_PREFIX = {
+    "openai":     ("OPENAI_API_KEY",),
+    "groq":       ("GROQ_API_KEY", "OPENAI_API_KEY"),
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "qianfan":    ("QIANFAN_API_KEY", "AISTUDIO_API_KEY"),
+}
+
+# OpenAI-compat base URL for each routed provider.
+_PROVIDER_URLS = {
+    "openai":     "https://api.openai.com/v1",
+    "groq":       "https://api.groq.com/openai/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "qianfan":    "https://qianfan.baidubce.com/v2",
+}
+
+
+def _resolve_provider_routing(model_str, env, runtime_config=None):
+    """Translate a LangChain-style ``<provider>:<id>`` model string into
+    the (prefix, model_id, provider_url, api_key) tuple openclaw needs.
+
+    OpenClaw is OpenAI-compatible only — its ``--custom-compatibility``
+    flag is hard-set to ``openai`` in setup() below. Model strings
+    arrive in LangChain-style ``<provider>:<id>`` form (the wheel's
+    config.py default is ``anthropic:claude-opus-4-7`` so
+    langchain/crewai consumers get a uniform string out of the box).
+
+    Routing rules:
+
+    * openai/groq/openrouter/qianfan → existing per-prefix routing,
+      each provider exposes an OpenAI-compat endpoint directly.
+    * anthropic/claude → re-route through OpenRouter, which exposes
+      Claude under the OpenAI-compat API at ``anthropic/<id>``
+      slash-form. Caught 2026-05-01: without this re-route,
+      ``anthropic:claude-X`` landed on the OPENAI_API_KEY +
+      api.openai.com path with ``claude-X`` as the model id, which
+      OpenAI doesn't host — every inference call failed silently and
+      the workspace looked online but was structurally broken.
+    * bare model id (no ``:``) → openai (legacy default, unchanged).
+    * unknown prefix → falls back to OPENAI_API_KEY/api.openai.com so
+      operator-supplied prefixes that genuinely *are* OpenAI-compat
+      pass through; explicit anthropic/claude is the only re-route.
+
+    Pure: takes ``env`` (a Mapping) and ``runtime_config`` (a Mapping
+    or None) so the test suite can exercise every branch without
+    monkeypatching ``os.environ``.
+    """
+    if ":" in model_str:
+        prefix, model = model_str.split(":", 1)
+    else:
+        prefix, model = "openai", model_str
+
+    if prefix in ("anthropic", "claude"):
+        if not env.get("OPENROUTER_API_KEY"):
+            raise RuntimeError(
+                f"openclaw adapter: model={model_str!r} requires "
+                "Anthropic/Claude routing but openclaw is OpenAI-"
+                "compatible only. Either: (a) set OPENROUTER_API_KEY in "
+                "workspace secrets so the adapter can route via "
+                "OpenRouter (which exposes Claude under OpenAI-compat "
+                "API), or (b) pick a model from the supported provider "
+                "list (openai/groq/openrouter/qianfan) and set "
+                "MODEL_PROVIDER on the workspace, e.g. "
+                "openrouter:anthropic/claude-sonnet-4."
+            )
+        # OpenRouter exposes Claude under `anthropic/<id>` slash form.
+        model = f"anthropic/{model}"
+        prefix = "openrouter"
+
+    env_vars = _API_KEY_BY_PREFIX.get(prefix, ("OPENAI_API_KEY",))
+    api_key = next((env[v] for v in env_vars if env.get(v)), "")
+    if not api_key:
+        raise RuntimeError(
+            f"openclaw adapter: no API key found for prefix={prefix!r} "
+            f"(checked: {', '.join(env_vars)}). Set one of those env "
+            f"vars in workspace secrets."
+        )
+
+    default_url = _PROVIDER_URLS.get(prefix, _PROVIDER_URLS["openai"])
+    if runtime_config is not None:
+        provider_url = runtime_config.get("provider_url", default_url)
+    else:
+        provider_url = default_url
+
+    return prefix, model, provider_url, api_key
+
 
 class OpenClawAdapter(BaseAdapter):
 
@@ -90,23 +179,15 @@ class OpenClawAdapter(BaseAdapter):
                 )
             logger.info("OpenClaw CLI installed")
 
-        # 2. Resolve API key and model
-        prefix = config.model.split(":")[0] if ":" in config.model else "openai"
-        if prefix == "qianfan":
-            api_key = os.environ.get("QIANFAN_API_KEY", os.environ.get("AISTUDIO_API_KEY", ""))
-        else:
-            api_key = os.environ.get("OPENAI_API_KEY", os.environ.get("GROQ_API_KEY", os.environ.get("OPENROUTER_API_KEY", "")))
-        # Determine provider URL from model prefix
-        provider_urls = {
-            "openai": "https://api.openai.com/v1",
-            "groq": "https://api.groq.com/openai/v1",
-            "openrouter": "https://openrouter.ai/api/v1",
-            "qianfan": "https://qianfan.baidubce.com/v2",
-        }
-        provider_url = config.runtime_config.get("provider_url", provider_urls.get(prefix, "https://api.openai.com/v1"))
-        model = config.model
-        if ":" in model:
-            _, model = model.split(":", 1)
+        # 2. Resolve API key and model via the pure routing helper.
+        prefix, model, provider_url, api_key = _resolve_provider_routing(
+            config.model, os.environ, config.runtime_config
+        )
+        if prefix == "openrouter" and config.model.split(":", 1)[0] in ("anthropic", "claude"):
+            logger.info(
+                "openclaw adapter: rerouting anthropic-prefixed model via OpenRouter (model=%s)",
+                model,
+            )
 
         # 3. Run non-interactive onboard
         if not os.path.exists(os.path.expanduser("~/.openclaw/openclaw.json")):
