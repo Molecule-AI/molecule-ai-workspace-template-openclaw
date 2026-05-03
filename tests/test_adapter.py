@@ -142,9 +142,13 @@ async def test_executor_happy_path_extracts_payload_text(monkeypatch):
 
     assert len(queue.events) == 1
     assert "openclaw answered: 42" in repr(queue.events[0])
-    # Subprocess was invoked with the expected fixed flags.
+    # Subprocess was invoked with the expected fixed flags. --local
+    # bypasses the openclaw gateway (which requires interactive device
+    # pairing + scope-upgrade approval) and runs the embedded agent
+    # against the auth-profiles.json setup() prepped.
     args = calls[0]["args"]
-    assert args[0:3] == ("openclaw", "agent", "--session-id")
+    assert args[0:3] == ("openclaw", "agent", "--local")
+    assert "--session-id" in args
     assert "--message" in args
     assert "ping" in args
     assert "--json" in args
