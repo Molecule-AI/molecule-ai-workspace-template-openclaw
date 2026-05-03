@@ -294,10 +294,19 @@ class OpenClawA2AExecutor(AgentExecutor):
 
         await set_current_task(self._heartbeat, brief_task(user_message))
 
-        # Call OpenClaw agent via CLI
+        # Call OpenClaw agent via CLI in --local (embedded) mode. The
+        # default path goes through the gateway, which requires a paired
+        # device and explicit scope-upgrade approvals — both interactive
+        # flows that don't fit a headless EC2 workspace. --local bypasses
+        # the gateway entirely and runs the embedded agent against the
+        # configured provider/key, exactly the surface our setup() prepped
+        # via auth-profiles.json + openclaw onboard. Pairing requirement
+        # discovered live during 2026-05-03 4-runtime A2A E2E (`scope
+        # upgrade pending approval` + `pairing required: device is asking
+        # for more scopes than ...`).
         try:
             proc = await asyncio.create_subprocess_exec(
-                "openclaw", "agent",
+                "openclaw", "agent", "--local",
                 "--session-id", context.task_id or "default",
                 "--message", user_message,
                 "--json", "--timeout", "120",
