@@ -63,3 +63,45 @@ curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt-get install -y --no-install-recommends nodejs
 
 echo "Node $(node --version) installed; npm $(npm --version)"
+
+# --- MiniMax routing ---------------------------------------------------
+# Same gap codex template hits: the provisioner has a MODEL_PROVIDER
+# env→config.yaml pass-through (ec2.go:1923) but never exports
+# MODEL_PROVIDER from user-data. Result: openclaw's adapter sees the
+# molecule_runtime library default `anthropic:claude-opus-4-7` and
+# fails fast with the "model requires Anthropic/Claude routing but
+# openclaw is OpenAI-compatible only" RuntimeError, /registry/register
+# never fires, the workspace flips to status=failed inside the
+# provisioning timeout window. Caught live during the 4-runtime A2A
+# E2E (2026-05-03).
+#
+# When the operator's only LLM key is MINIMAX_API_KEY, route the
+# `openai` prefix at MiniMax's OpenAI-compat endpoint and pin the
+# default model to a MiniMax one. The adapter's `_resolve_provider_routing`
+# already honors `OPENAI_BASE_URL` (cf. adapter.py:111), so this hooks
+# into the supported override surface — no adapter change needed.
+if [ -n "${MINIMAX_API_KEY:-}" ] && [ -z "${MODEL_PROVIDER:-}" ] && [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
+  WORKSPACE_CONFIG_DIR="${WORKSPACE_CONFIG_PATH:-/configs}"
+  WORKSPACE_CONFIG="${WORKSPACE_CONFIG_DIR}/config.yaml"
+  OPENCLAW_MINIMAX_MODEL="${OPENCLAW_MINIMAX_MODEL:-MiniMax-M2.1}"
+  if [ -f "$WORKSPACE_CONFIG" ] && [ -w "$WORKSPACE_CONFIG_DIR" ]; then
+    if grep -qE '^model:' "$WORKSPACE_CONFIG"; then
+      sed -i.bak "s|^model: .*|model: 'openai:${OPENCLAW_MINIMAX_MODEL}'|" "$WORKSPACE_CONFIG" && rm -f "${WORKSPACE_CONFIG}.bak"
+    else
+      printf "model: 'openai:%s'\n" "$OPENCLAW_MINIMAX_MODEL" >> "$WORKSPACE_CONFIG"
+    fi
+    echo "[install.sh] patched ${WORKSPACE_CONFIG} model=openai:${OPENCLAW_MINIMAX_MODEL} (MiniMax routing via OpenAI-compat)"
+  elif [ -f "$WORKSPACE_CONFIG" ]; then
+    echo "[install.sh] WARN: ${WORKSPACE_CONFIG} not writable; runtime may fall back to default model" >&2
+  fi
+  # Persist OPENAI_API_KEY + OPENAI_BASE_URL so the adapter's setup()
+  # picks them up on its first env read. /etc/environment is the
+  # standard place for system-wide env on Ubuntu cloud-init AMIs.
+  if [ -w /etc/environment ] || sudo -n true 2>/dev/null; then
+    sudo bash -c "{
+      echo 'OPENAI_API_KEY=${MINIMAX_API_KEY}'
+      echo 'OPENAI_BASE_URL=${MINIMAX_API_BASE:-https://api.minimax.io/v1}'
+    } >> /etc/environment"
+    echo "[install.sh] exported OPENAI_API_KEY=<MINIMAX_API_KEY> OPENAI_BASE_URL=${MINIMAX_API_BASE:-https://api.minimax.io/v1} → /etc/environment"
+  fi
+fi
