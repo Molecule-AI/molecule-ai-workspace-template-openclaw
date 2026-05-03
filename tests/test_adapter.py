@@ -126,10 +126,13 @@ def _make_subprocess_factory(*, stdout: bytes, stderr: bytes = b"", returncode: 
 
 @pytest.mark.asyncio
 async def test_executor_happy_path_extracts_payload_text(monkeypatch):
+    # Top-level "payloads" — the real shape `openclaw agent --json`
+    # emits. A previous version of this test (and the adapter) wrapped
+    # payloads under "result", which never matched the CLI and caused
+    # the canvas to render the raw envelope dict.
     payload = {
-        "result": {
-            "payloads": [{"text": "openclaw answered: 42"}]
-        }
+        "payloads": [{"text": "openclaw answered: 42"}],
+        "meta": {"finalAssistantVisibleText": "openclaw answered: 42"},
     }
     fake_exec, calls = _make_subprocess_factory(stdout=json.dumps(payload).encode())
     monkeypatch.setattr(
@@ -174,11 +177,17 @@ async def test_executor_empty_message_short_circuits(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_executor_falls_back_to_stringified_result_when_no_payloads(monkeypatch):
-    """If the JSON parses but result.payloads is empty, fall back to
-    str(data) so we still emit something rather than swallowing the
-    response."""
-    payload = {"result": {"payloads": []}, "extra": "info"}
+async def test_executor_concatenates_multiple_payloads(monkeypatch):
+    """openclaw turns that include an interim narration ("Let me check!")
+    plus the actual answer come back as multiple payload entries. The
+    extractor must surface both, joined by a blank line, so the user
+    doesn't see a truncated reply."""
+    payload = {
+        "payloads": [
+            {"text": "Let me check!"},
+            {"text": "Yep — codex and hermes are online."},
+        ]
+    }
     fake_exec, _ = _make_subprocess_factory(stdout=json.dumps(payload).encode())
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
 
@@ -186,11 +195,58 @@ async def test_executor_falls_back_to_stringified_result_when_no_payloads(monkey
     queue = _CapturingQueue()
     await executor.execute(_ctx("hi"), queue)
 
-    assert len(queue.events) == 1
     text = repr(queue.events[0])
-    # The full dict's str form should be in the event.
-    assert "result" in text
-    assert "extra" in text
+    assert "Let me check!" in text
+    assert "codex and hermes are online" in text
+
+
+@pytest.mark.asyncio
+async def test_executor_falls_back_to_meta_visible_text_when_no_payloads(monkeypatch):
+    """If `payloads` is missing/empty but `meta.finalAssistantVisibleText`
+    has the rendered reply, surface that instead of the raw envelope."""
+    payload = {"payloads": [], "meta": {"finalAssistantVisibleText": "rendered reply"}}
+    fake_exec, _ = _make_subprocess_factory(stdout=json.dumps(payload).encode())
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    queue = _CapturingQueue()
+    await executor.execute(_ctx("hi"), queue)
+
+    text = repr(queue.events[0])
+    assert "rendered reply" in text
+    # Regression: meta envelope should NOT leak.
+    assert "finalAssistantVisibleText" not in text
+
+
+@pytest.mark.asyncio
+async def test_executor_does_not_leak_envelope_dict(monkeypatch):
+    """REGRESSION (2026-05-03): when payload extraction failed, the
+    adapter used to fall back to ``str(data)``, dumping the entire
+    `{'payloads':[...], 'meta':{...}}` envelope — including the
+    bootstrap prompt, sessionId, agent harness metadata, full system
+    prompt report, and tool schemas — into the canvas chat as the
+    assistant's reply. The reply must NEVER include those fields."""
+    payload = {
+        "payloads": [{"text": "the only thing the user should see"}],
+        "meta": {
+            "sessionId": "secret-session-id",
+            "systemPromptReport": {"chars": 26027, "tools": ["leaky"]},
+            "agentMeta": {"provider": "custom-api-minimax-io"},
+        },
+    }
+    fake_exec, _ = _make_subprocess_factory(stdout=json.dumps(payload).encode())
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    queue = _CapturingQueue()
+    await executor.execute(_ctx("hi"), queue)
+
+    text = repr(queue.events[0])
+    assert "the only thing the user should see" in text
+    for leaked_field in ("sessionId", "systemPromptReport", "agentMeta",
+                         "secret-session-id", "custom-api-minimax-io"):
+        assert leaked_field not in text, \
+            f"envelope field {leaked_field!r} leaked into the assistant reply"
 
 
 @pytest.mark.asyncio
@@ -304,7 +360,7 @@ async def test_executor_clears_current_task_on_completion(monkeypatch):
     """set_current_task should be called twice: once with the brief
     summary at the start, once with the empty string in the finally."""
 
-    payload = {"result": {"payloads": [{"text": "ok"}]}}
+    payload = {"payloads": [{"text": "ok"}]}
     fake_exec, _ = _make_subprocess_factory(stdout=json.dumps(payload).encode())
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
 
