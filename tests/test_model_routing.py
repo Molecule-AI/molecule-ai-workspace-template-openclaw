@@ -225,6 +225,47 @@ def test_runtime_config_provider_url_overrides_default(resolve):
     assert url == "https://my-gateway.internal/v1"
 
 
+def test_env_base_url_overrides_default(resolve):
+    """``OPENAI_BASE_URL`` (SDK-convention env var) routes the openai
+    prefix at a custom OpenAI-compat shim — needed for MiniMax /
+    local-llama / internal-proxy users who only have the workspace
+    secrets API to influence routing (config.yaml's
+    runtime_config.provider_url isn't surfaced in the canvas Config
+    tab). 2026-05-03 4-runtime A2A E2E caught this: MiniMax key on
+    the openai prefix round-tripped to api.openai.com without env
+    honoring."""
+    _, _, url, _ = resolve(
+        "openai:MiniMax-M2.7",
+        env={"OPENAI_API_KEY": "sk-test", "OPENAI_BASE_URL": "https://api.minimax.io/v1"},
+        runtime_config={},
+    )
+    assert url == "https://api.minimax.io/v1"
+
+
+def test_env_base_url_overrides_runtime_config_provider_url(resolve):
+    """Env wins over config.yaml — operators reach for env first
+    (workspace-secrets API surface) and shouldn't have a stale
+    config.yaml override silently shadow it."""
+    _, _, url, _ = resolve(
+        "openai:gpt-4o",
+        env={"OPENAI_API_KEY": "sk-test", "OPENAI_BASE_URL": "https://override.example/v1"},
+        runtime_config={"provider_url": "https://stale-yaml.internal/v1"},
+    )
+    assert url == "https://override.example/v1"
+
+
+def test_env_base_url_per_prefix(resolve):
+    """The env override is per-prefix: `OPENROUTER_BASE_URL` overrides
+    the openrouter default, `GROQ_BASE_URL` the groq default, etc.
+    Pins the generalized `<PREFIX>_BASE_URL` shape."""
+    _, _, url, _ = resolve(
+        "openrouter:anthropic/claude-sonnet-4-5",
+        env={"OPENROUTER_API_KEY": "sk-or", "OPENROUTER_BASE_URL": "https://or-mirror.internal/api/v1"},
+        runtime_config={},
+    )
+    assert url == "https://or-mirror.internal/api/v1"
+
+
 def test_runtime_config_none_uses_default(resolve):
     """Defensive: setup() always passes ``config.runtime_config`` (a
     dict) but the helper accepts ``None`` so unit tests / ad-hoc
