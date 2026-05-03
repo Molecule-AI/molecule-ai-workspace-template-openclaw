@@ -40,6 +40,7 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 
 COPY adapter.py .
 COPY __init__.py .
+COPY gateway_client.py .
 
 ENV ADAPTER_MODULE=adapter
 
