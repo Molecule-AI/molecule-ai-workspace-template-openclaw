@@ -62,19 +62,26 @@ def _event_text(event: Any) -> str:
     return event.parts[0].text
 
 
-def _ctx(text: str, *, task_id: str = "task-A"):
+def _ctx(text: str, *, task_id: str = "task-A", context_id: str = "ctx-A"):
     """Stand up a context that extract_message_text(context) will read.
 
     extract_message_text inspects part.text first then part.root.text;
     MagicMock auto-attributes resolve part.root.text to a MagicMock (not
     a string), tripping a TypeError in the join. Use a dict-shaped part
     instead — simpler and matches how the a2a-sdk wire format actually
-    serializes."""
+    serializes.
+
+    task_id + context_id are pinned to plain strings (not MagicMock
+    auto-attributes) because new_response_message uses them as Message
+    proto fields, and the proto type-check rejects MagicMock instances
+    with `TypeError: bad argument type for built-in operation`."""
     msg = MagicMock()
     msg.parts = [{"text": text, "kind": "text"}]
     msg.task_id = task_id
+    msg.context_id = context_id
     ctx = MagicMock()
     ctx.task_id = task_id
+    ctx.context_id = context_id
     ctx.message = msg
     return ctx
 
@@ -113,328 +120,300 @@ async def test_create_executor_returns_a2a_executor():
     assert executor._heartbeat is None
 
 
-# ---- executor: happy path ------------------------------------------
 
 
-def _make_subprocess_factory(*, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
-    """Build a fake create_subprocess_exec that returns a process whose
-    communicate() returns the given stdout/stderr/returncode."""
+# ---- executor: gateway WS path (push parity refactor) -----------------
+#
+# All executor tests below mock the GatewayClient directly — no
+# subprocess shell-out path remains in the executor after the
+# sessions.steer push-parity refactor (#25). Tests assert WS request
+# shape (method names, params), session+run lifecycle (steer when
+# active, send + agent.wait when not), and assistant-text extraction
+# from chat.history.
 
-    captured_calls: List[dict] = []
 
-    async def fake_exec(*args, **kwargs):
-        captured_calls.append({"args": args, "kwargs": kwargs})
-        proc = MagicMock()
-        proc.returncode = returncode
+class _FakeGateway:
+    """Stand-in for GatewayClient.
 
-        async def fake_communicate():
-            return stdout, stderr
+    Records every request() call. Test-controllable response per method
+    via ``responses[method]`` (callable returning a dict) or default
+    success shape. ``raise_on`` lets tests inject GatewayError /
+    asyncio.TimeoutError for one specific method.
+    """
 
-        proc.communicate = fake_communicate
-        return proc
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict]] = []
+        self.responses: dict[str, Any] = {}
+        self.raise_on: dict[str, Exception] = {}
+        self.closed = False
 
-    return fake_exec, captured_calls
+    async def request(self, method: str, params: dict | None = None, *, timeout: float | None = None) -> dict:
+        self.requests.append((method, params or {}))
+        if method in self.raise_on:
+            raise self.raise_on[method]
+        if method in self.responses:
+            handler = self.responses[method]
+            return handler(params or {}) if callable(handler) else handler
+        # Sensible defaults for the methods the executor routes.
+        if method == "sessions.send":
+            return {"runId": (params or {}).get("idempotencyKey", "run-default"), "messageSeq": 1}
+        if method == "sessions.steer":
+            return {"runId": (params or {}).get("idempotencyKey", "run-default"), "messageSeq": 1}
+        if method == "agent.wait":
+            return {"status": "ok", "endedAt": 0}
+        if method == "chat.history":
+            return {
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "in"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "default-reply"}]},
+                ]
+            }
+        if method == "sessions.abort":
+            return {"ok": True}
+        return {}
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 @pytest.mark.asyncio
-async def test_executor_happy_path_extracts_payload_text(monkeypatch):
-    # Top-level "payloads" — the real shape `openclaw agent --json`
-    # emits. A previous version of this test (and the adapter) wrapped
-    # payloads under "result", which never matched the CLI and caused
-    # the canvas to render the raw envelope dict.
-    payload = {
-        "payloads": [{"text": "openclaw answered: 42"}],
-        "meta": {"finalAssistantVisibleText": "openclaw answered: 42"},
-    }
-    fake_exec, calls = _make_subprocess_factory(stdout=json.dumps(payload).encode())
-    monkeypatch.setattr(
-        "asyncio.create_subprocess_exec", fake_exec
-    )
-
+async def test_executor_empty_message_short_circuits():
+    """Whitespace-only messages return early without touching the
+    gateway. Mirrors the prior subprocess behavior."""
     executor = OpenClawA2AExecutor(heartbeat=None)
     queue = _CapturingQueue()
-    await executor.execute(_ctx("ping"), queue)
-
+    await executor.execute(_ctx("   "), queue)
     assert len(queue.events) == 1
-    # Exact equality, not substring-in-repr: a substring check would still
-    # pass if the extractor silently fell back to `output` (the raw JSON
-    # string), which contains the literal text inside the `payloads`
-    # array. Comparing exact event text catches that drift.
-    assert _event_text(queue.events[0]) == "openclaw answered: 42"
-    # Subprocess was invoked with the expected fixed flags. --local
-    # bypasses the openclaw gateway (which requires interactive device
-    # pairing + scope-upgrade approval) and runs the embedded agent
-    # against the auth-profiles.json setup() prepped.
-    args = calls[0]["args"]
-    assert args[0:3] == ("openclaw", "agent", "--local")
-    assert "--session-id" in args
-    assert "--message" in args
-    assert "ping" in args
-    assert "--json" in args
+    assert "No message provided" in _event_text(queue.events[0])
 
 
 @pytest.mark.asyncio
-async def test_executor_empty_message_short_circuits(monkeypatch):
-    """If the inbound has no usable text, executor must NOT spawn a
-    subprocess; it should emit 'No message provided' immediately."""
-    fake_exec, calls = _make_subprocess_factory(stdout=b"")
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
-
-    executor = OpenClawA2AExecutor(heartbeat=None)
-    queue = _CapturingQueue()
-    await executor.execute(_ctx(""), queue)
-
-    assert len(queue.events) == 1
-    assert _event_text(queue.events[0]) == "No message provided"
-    assert calls == []  # subprocess NOT spawned
-
-
-# ---- executor: result-shape edge cases ------------------------------
-
-
-@pytest.mark.asyncio
-async def test_executor_concatenates_multiple_payloads(monkeypatch):
-    """openclaw turns that include an interim narration ("Let me check!")
-    plus the actual answer come back as multiple payload entries. The
-    extractor must surface both, joined by a blank line, so the user
-    doesn't see a truncated reply."""
-    payload = {
-        "payloads": [
-            {"text": "Let me check!"},
-            {"text": "Yep — codex and hermes are online."},
+async def test_executor_happy_path_send_then_history(monkeypatch):
+    """First message: no active run → sessions.send → agent.wait →
+    chat.history. The most recent assistant text from chat.history
+    is returned as the A2A response."""
+    fake = _FakeGateway()
+    fake.responses["sessions.send"] = lambda p: {"runId": "run-1", "messageSeq": 1}
+    fake.responses["chat.history"] = lambda p: {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "what is 2+2"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "openclaw says 4"}]},
         ]
     }
-    fake_exec, _ = _make_subprocess_factory(stdout=json.dumps(payload).encode())
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
 
     executor = OpenClawA2AExecutor(heartbeat=None)
-    queue = _CapturingQueue()
-    await executor.execute(_ctx("hi"), queue)
+    executor._gateway = fake  # skip lazy init
 
-    # Exact equality on the joined output — a substring-in-repr would
-    # still pass if extraction failed and the raw JSON dropped both
-    # texts as substrings inside the dumped envelope.
-    assert _event_text(queue.events[0]) == \
-        "Let me check!\n\nYep — codex and hermes are online."
+    queue = _CapturingQueue()
+    await executor.execute(_ctx("what is 2+2"), queue)
+
+    methods = [m for m, _ in fake.requests]
+    # Exact RPC sequence — no sessions.steer because no active run.
+    assert methods == ["sessions.send", "agent.wait", "chat.history"], methods
+    # send was called with our session key + the user message.
+    send_method, send_params = fake.requests[0]
+    assert send_params["key"] == OpenClawA2AExecutor._SESSION_KEY
+    assert send_params["message"] == "what is 2+2"
+    assert send_params["idempotencyKey"].startswith("send-")
+    # Reply is the assistant text from chat.history.
+    assert _event_text(queue.events[0]) == "openclaw says 4"
 
 
 @pytest.mark.asyncio
-async def test_executor_falls_back_to_meta_visible_text_when_no_payloads(monkeypatch):
-    """If `payloads` is missing/empty but `meta.finalAssistantVisibleText`
-    has the rendered reply, surface that instead of the raw envelope."""
-    payload = {"payloads": [], "meta": {"finalAssistantVisibleText": "rendered reply"}}
-    fake_exec, _ = _make_subprocess_factory(stdout=json.dumps(payload).encode())
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+async def test_executor_steers_when_run_active():
+    """Mid-flight arrival: an active run is recorded → sessions.steer
+    fires (NOT sessions.send) → execute() returns a placeholder
+    immediately. Push parity with codex/turn-steer + claude-code
+    notifications/claude/channel."""
+    fake = _FakeGateway()
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    executor._gateway = fake
+    # Simulate "run already in flight" — set the active marker.
+    executor._active_run_id = "run-already-running"
+
+    queue = _CapturingQueue()
+    await executor.execute(_ctx("steered prompt"), queue)
+
+    methods = [m for m, _ in fake.requests]
+    # Exact one-call shape — no fallback to send.
+    assert methods == ["sessions.steer"], methods
+    steer_method, steer_params = fake.requests[0]
+    assert steer_params["key"] == OpenClawA2AExecutor._SESSION_KEY
+    assert steer_params["message"] == "steered prompt"
+    assert steer_params["idempotencyKey"].startswith("steer-")
+    # Placeholder delivered as A2A response.
+    assert "steered into in-flight openclaw run" in _event_text(queue.events[0])
+
+
+@pytest.mark.asyncio
+async def test_executor_steer_failure_falls_through_to_send():
+    """If sessions.steer raises (NoActiveRun / not steerable / transport
+    hiccup), executor falls through to the sessions.send path so the
+    message still gets processed."""
+    from gateway_client import GatewayError
+
+    fake = _FakeGateway()
+    fake.raise_on["sessions.steer"] = GatewayError("sessions.steer", "NoActiveRun", "no active run")
 
     executor = OpenClawA2AExecutor(heartbeat=None)
+    executor._gateway = fake
+    executor._active_run_id = "stale-run-id"  # we believe one is active, but the gateway disagrees
+
+    queue = _CapturingQueue()
+    await executor.execute(_ctx("retry me"), queue)
+
+    methods = [m for m, _ in fake.requests]
+    # Steer attempted, then fall-through to send/wait/history.
+    assert methods == ["sessions.steer", "sessions.send", "agent.wait", "chat.history"]
+    # Reply is real text (not the placeholder).
+    text = _event_text(queue.events[0])
+    assert "steered into" not in text
+
+
+@pytest.mark.asyncio
+async def test_executor_clears_active_run_on_completion():
+    """After sessions.send + agent.wait + chat.history complete,
+    `_active_run_id` is cleared so the NEXT message takes the send
+    path again (correct steady-state — steer is only meaningful while
+    a run is genuinely in flight)."""
+    fake = _FakeGateway()
+    fake.responses["sessions.send"] = lambda p: {"runId": "run-X", "messageSeq": 1}
+
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    executor._gateway = fake
+
+    queue = _CapturingQueue()
+    await executor.execute(_ctx("first"), queue)
+
+    assert executor._active_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_executor_returns_placeholder_when_history_empty():
+    """If chat.history returns no assistant message (gateway race or
+    silence), the executor returns a clear placeholder rather than
+    empty-string-as-reply (which the canvas renders as a phantom blank
+    bubble)."""
+    fake = _FakeGateway()
+    fake.responses["chat.history"] = lambda p: {"messages": []}
+
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    executor._gateway = fake
+
+    queue = _CapturingQueue()
+    await executor.execute(_ctx("question"), queue)
+
+    text = _event_text(queue.events[0])
+    assert "no assistant text" in text
+
+
+@pytest.mark.asyncio
+async def test_executor_handles_send_failure_gracefully():
+    """sessions.send failing returns a clean error message, not an
+    exception leak."""
+    from gateway_client import GatewayError
+
+    fake = _FakeGateway()
+    fake.raise_on["sessions.send"] = GatewayError("sessions.send", "BadParams", "missing key")
+
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    executor._gateway = fake
+
     queue = _CapturingQueue()
     await executor.execute(_ctx("hi"), queue)
 
     text = _event_text(queue.events[0])
-    assert text == "rendered reply"
-    # Regression: meta envelope key name should NOT leak into the reply.
-    assert "finalAssistantVisibleText" not in text
+    assert "OpenClaw sessions.send failed" in text
+    assert "BadParams" in text
 
 
-@pytest.mark.asyncio
-async def test_executor_does_not_leak_envelope_dict(monkeypatch):
-    """REGRESSION (2026-05-03): when payload extraction failed, the
-    adapter used to fall back to ``str(data)``, dumping the entire
-    `{'payloads':[...], 'meta':{...}}` envelope — including the
-    bootstrap prompt, sessionId, agent harness metadata, full system
-    prompt report, and tool schemas — into the canvas chat as the
-    assistant's reply. The reply must NEVER include those fields."""
-    payload = {
-        "payloads": [{"text": "the only thing the user should see"}],
-        "meta": {
-            "sessionId": "secret-session-id",
-            "systemPromptReport": {"chars": 26027, "tools": ["leaky"]},
-            "agentMeta": {"provider": "custom-api-minimax-io"},
-        },
+# ---- _assistant_text_from_history -------------------------------------
+
+
+def test_assistant_text_from_history_picks_most_recent():
+    """When history has multiple assistant messages (multi-turn), the
+    helper returns the most recent one."""
+    from adapter import _assistant_text_from_history
+
+    hist = {
+        "messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "first reply"}]},
+            {"role": "user", "content": [{"type": "text", "text": "follow-up"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "second reply"}]},
+        ]
     }
-    fake_exec, _ = _make_subprocess_factory(stdout=json.dumps(payload).encode())
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
-
-    executor = OpenClawA2AExecutor(heartbeat=None)
-    queue = _CapturingQueue()
-    await executor.execute(_ctx("hi"), queue)
-
-    text = _event_text(queue.events[0])
-    # Exact equality: the reply must be ONLY the payload text — no
-    # envelope spillover, no field-name labels, no surrounding dict
-    # punctuation.
-    assert text == "the only thing the user should see"
-    for leaked_field in ("sessionId", "systemPromptReport", "agentMeta",
-                         "secret-session-id", "custom-api-minimax-io"):
-        assert leaked_field not in text, \
-            f"envelope field {leaked_field!r} leaked into the assistant reply"
+    assert _assistant_text_from_history(hist) == "second reply"
 
 
-@pytest.mark.asyncio
-async def test_executor_falls_back_to_raw_output_on_invalid_json(monkeypatch):
-    """If openclaw prints a non-JSON line (early-exit warning, etc.),
-    surface the raw text rather than crash."""
-    fake_exec, _ = _make_subprocess_factory(stdout=b"not json at all")
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+def test_assistant_text_from_history_handles_string_content():
+    """Some chat.history entries carry `content` as a plain string,
+    not a structured parts list. Extractor must accept both shapes."""
+    from adapter import _assistant_text_from_history
 
-    executor = OpenClawA2AExecutor(heartbeat=None)
-    queue = _CapturingQueue()
-    await executor.execute(_ctx("hi"), queue)
-
-    assert _event_text(queue.events[0]) == "not json at all"
+    hist = {"messages": [{"role": "assistant", "content": "plain string reply"}]}
+    assert _assistant_text_from_history(hist) == "plain string reply"
 
 
-# ---- executor: error paths ------------------------------------------
+def test_assistant_text_from_history_skips_user_rows():
+    """User-role rows must never be returned, even if they're the last
+    row (race where the user's message is appended but the assistant
+    response is still rendering)."""
+    from adapter import _assistant_text_from_history
+
+    hist = {
+        "messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "old"}]},
+            {"role": "user", "content": [{"type": "text", "text": "new q"}]},
+        ]
+    }
+    assert _assistant_text_from_history(hist) == "old"
 
 
-@pytest.mark.asyncio
-async def test_executor_handles_nonzero_exit_with_stderr(monkeypatch):
-    fake_exec, _ = _make_subprocess_factory(
-        stdout=b"", stderr=b"openclaw boom", returncode=1
-    )
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+def test_assistant_text_from_history_returns_empty_on_no_assistant():
+    """Pin: an all-user history returns empty string. Caller decides
+    how to surface (the executor returns a placeholder)."""
+    from adapter import _assistant_text_from_history
 
-    executor = OpenClawA2AExecutor(heartbeat=None)
-    queue = _CapturingQueue()
-    await executor.execute(_ctx("trigger error"), queue)
-
-    text = repr(queue.events[0])
-    assert "OpenClaw error" in text
-    assert "boom" in text
-
-
-@pytest.mark.asyncio
-async def test_executor_handles_nonzero_exit_no_stderr(monkeypatch):
-    """Same path as above but without stderr — confirm fallback message
-    mentions the return code."""
-    fake_exec, _ = _make_subprocess_factory(
-        stdout=b"", stderr=b"", returncode=2
-    )
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
-
-    executor = OpenClawA2AExecutor(heartbeat=None)
-    queue = _CapturingQueue()
-    await executor.execute(_ctx("trigger error"), queue)
-
-    text = repr(queue.events[0])
-    # When there's no stderr, code falls through the truthy stderr check
-    # to print returncode in the alternate branch.
-    assert "OpenClaw" in text
-    # Either the "code 2" or "OpenClaw error: " path; both are acceptable.
-    assert ("code 2" in text) or ("OpenClaw error" in text)
-
-
-@pytest.mark.asyncio
-async def test_executor_handles_subprocess_timeout(monkeypatch):
-    """asyncio.wait_for raises TimeoutError when the subprocess exceeds
-    130s — executor must emit a timeout message rather than propagate."""
-
-    async def slow_exec(*args, **kwargs):
-        proc = MagicMock()
-        proc.returncode = 0
-
-        async def slow_communicate():
-            await asyncio.sleep(10)  # would exceed our patched timeout
-            return b"", b""
-
-        proc.communicate = slow_communicate
-        return proc
-
-    monkeypatch.setattr("asyncio.create_subprocess_exec", slow_exec)
-    real_wait_for = asyncio.wait_for
-
-    async def fast_wait_for(coro, timeout):
-        # Hand back a fast timeout regardless of caller's value.
-        return await real_wait_for(coro, timeout=0.05)
-
-    monkeypatch.setattr("asyncio.wait_for", fast_wait_for)
-
-    executor = OpenClawA2AExecutor(heartbeat=None)
-    queue = _CapturingQueue()
-    await executor.execute(_ctx("slow query"), queue)
-
-    text = repr(queue.events[0])
-    assert "timed out" in text or "TimeoutError" in text or "OpenClaw" in text
-
-
-@pytest.mark.asyncio
-async def test_executor_handles_generic_exception(monkeypatch):
-    async def exploding_exec(*args, **kwargs):
-        raise RuntimeError("subprocess.create exploded")
-
-    monkeypatch.setattr("asyncio.create_subprocess_exec", exploding_exec)
-
-    executor = OpenClawA2AExecutor(heartbeat=None)
-    queue = _CapturingQueue()
-    await executor.execute(_ctx("hi"), queue)
-
-    text = repr(queue.events[0])
-    assert "OpenClaw error" in text
-    assert "exploded" in text
-
-
-# ---- executor: heartbeat side-effects -------------------------------
-
-
-@pytest.mark.asyncio
-async def test_executor_clears_current_task_on_completion(monkeypatch):
-    """set_current_task should be called twice: once with the brief
-    summary at the start, once with the empty string in the finally."""
-
-    payload = {"payloads": [{"text": "ok"}]}
-    fake_exec, _ = _make_subprocess_factory(stdout=json.dumps(payload).encode())
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
-
-    set_calls: List[str] = []
-
-    async def fake_set_current_task(heartbeat, value):
-        set_calls.append(value)
-
-    monkeypatch.setattr("adapter.set_current_task", fake_set_current_task)
-
-    fake_heartbeat = MagicMock()
-    executor = OpenClawA2AExecutor(heartbeat=fake_heartbeat)
-    queue = _CapturingQueue()
-    await executor.execute(_ctx("ping"), queue)
-
-    # First call sets the brief, second call clears.
-    assert len(set_calls) == 2
-    assert set_calls[0]  # non-empty
-    assert set_calls[1] == ""
-
-
-@pytest.mark.asyncio
-async def test_executor_clears_current_task_on_exception(monkeypatch):
-    """Even if execute() crashes inside the subprocess block, the
-    finally-clause must reset the heartbeat task to ''."""
-
-    async def exploding_exec(*args, **kwargs):
-        raise RuntimeError("crash")
-
-    monkeypatch.setattr("asyncio.create_subprocess_exec", exploding_exec)
-
-    set_calls: List[str] = []
-
-    async def fake_set_current_task(heartbeat, value):
-        set_calls.append(value)
-
-    monkeypatch.setattr("adapter.set_current_task", fake_set_current_task)
-
-    executor = OpenClawA2AExecutor(heartbeat=MagicMock())
-    queue = _CapturingQueue()
-    await executor.execute(_ctx("crash"), queue)
-
-    assert "" in set_calls
-    assert len(set_calls) == 2  # set + clear
+    assert _assistant_text_from_history({"messages": []}) == ""
+    assert _assistant_text_from_history({}) == ""
+    assert _assistant_text_from_history({"messages": [{"role": "user", "content": "q"}]}) == ""
 
 
 # ---- executor: cancel -----------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_cancel_is_noop():
-    """OpenClaw doesn't expose an interrupt API today; cancel() is a
-    no-op and must not raise."""
+async def test_cancel_no_gateway_is_noop():
+    """cancel() before _ensure_gateway has connected is a no-op."""
     executor = OpenClawA2AExecutor(heartbeat=None)
+    assert executor._gateway is None
     result = await executor.cancel(MagicMock(), _CapturingQueue())
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_no_active_run_is_noop():
+    """Gateway connected but no run active → cancel() doesn't fire abort."""
+    fake = _FakeGateway()
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    executor._gateway = fake
+
+    await executor.cancel(MagicMock(), _CapturingQueue())
+    assert not any(m == "sessions.abort" for m, _ in fake.requests)
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_active_run_fires_abort():
+    """Active run + gateway → sessions.abort with key + runId."""
+    fake = _FakeGateway()
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    executor._gateway = fake
+    executor._active_run_id = "run-cancel-me"
+
+    await executor.cancel(MagicMock(), _CapturingQueue())
+
+    aborts = [(m, p) for m, p in fake.requests if m == "sessions.abort"]
+    assert len(aborts) == 1
+    _, params = aborts[0]
+    assert params["key"] == OpenClawA2AExecutor._SESSION_KEY
+    assert params["runId"] == "run-cancel-me"

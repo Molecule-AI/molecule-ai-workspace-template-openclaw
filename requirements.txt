@@ -1,5 +1,9 @@
 # Molecule AI workspace runtime — shared infrastructure
 molecule-ai-workspace-runtime>=0.1.0
 
+# WebSocket client for the OpenClaw gateway protocol (push-parity refactor —
+# replaces the prior `openclaw agent --local` subprocess with the gateway's
+# sessions.send / sessions.steer / agent.wait WS RPCs).
+aiohttp>=3.9
+
 # OpenClaw is a Node.js CLI — installed via npm at startup, not pip
-# The adapter only needs httpx for HTTP proxying (already in runtime package)
