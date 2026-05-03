@@ -25,6 +25,13 @@ WORKDIR /app
 # fix for the cascade cache trap that bit us 5x on 2026-04-27.
 ARG RUNTIME_VERSION=
 
+# Bump pip + setuptools + wheel BEFORE installing project deps — the
+# python:3.11-slim base ships old transitives (jaraco.context, wheel,
+# setuptools) Trivy flags as fixable HIGH CVEs. Bumping here resolves
+# them at the metadata layer; subsequent pip installs use the upgraded
+# resolvers. molecule-ci#38 Phase-1.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
