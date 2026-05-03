@@ -1,4 +1,12 @@
-FROM python:3.11-slim
+# Pin by digest, not tag — avoids surprise base-bumps. Pairs with the
+# Trivy gate in molecule-ci/.github/workflows/publish-template-image.yml
+# (PR #35): pin avoids unexpected upgrade, Trivy catches if the pinned
+# digest accumulates fixable HIGH/CRITICAL vulns over time. Bump
+# deliberately by re-resolving:
+#   docker pull --platform linux/amd64 python:3.11-slim
+#   docker inspect --format='{{index .RepoDigests 0}}' python:3.11-slim
+# Last resolved: 2026-05-03 (RFC #388 PR-2b).
+FROM python:3.11-slim@sha256:6d85378d88a19cd4d76079817532d62232be95757cb45945a99fec8e8084b9c2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl gosu ca-certificates nodejs npm \
