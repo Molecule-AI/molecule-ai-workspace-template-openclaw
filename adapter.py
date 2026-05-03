@@ -545,6 +545,31 @@ class OpenClawA2AExecutor(AgentExecutor):
         except Exception as exc:  # noqa: BLE001
             return f"OpenClaw gateway connect failed: {exc}"
 
+        # ConnectionError unwinds out of any gw.request() call when the
+        # WS has died mid-session (gateway restart, network blip, host
+        # process crashed). Without resetting `self._gateway`, the cached
+        # closed client persists across execute() calls and every
+        # subsequent dispatch fails identically — workspace wedges
+        # invisibly. Reset so the NEXT call reconnects.
+        # See #27 (c) for the post-merge review that surfaced this.
+        try:
+            return await self._dispatch_inner(gw, user_message)
+        except ConnectionError as exc:
+            logger.warning("openclaw gateway WS dropped (%s) — clearing cache for next reconnect", exc)
+            async with self._gateway_lock:
+                if self._gateway is gw:
+                    self._gateway = None
+            async with self._active_run_lock:
+                self._active_run_id = None
+            return f"OpenClaw gateway disconnected: {exc}. Retry the message — the next call will reconnect."
+
+    async def _dispatch_inner(self, gw, user_message: str) -> str:
+        """Steer / send / wait / history. Extracted so the outer
+        `_dispatch` can wrap a single ConnectionError handler around
+        all gw.request() call sites without duplicating the logic.
+        """
+        from gateway_client import GatewayError
+
         # Push parity: when a run is already in flight for this session,
         # inject the new message via sessions.steer instead of waiting
         # on the prior run to finish. The agent sees both prompts in
