@@ -109,8 +109,26 @@ def _resolve_provider_routing(model_str, env, runtime_config=None):
             f"vars in workspace secrets."
         )
 
+    # Provider URL precedence:
+    #   1. <PREFIX>_BASE_URL env var (SDK convention — `OPENAI_BASE_URL`,
+    #      `OPENROUTER_BASE_URL`, etc.) — lets operators point any
+    #      OpenAI-compat prefix at a custom shim (MiniMax, local llama-
+    #      cpp, internal proxy) via the workspace-secrets API.
+    #   2. runtime_config.provider_url from config.yaml (explicit per-
+    #      workspace override).
+    #   3. _PROVIDER_URLS default for the prefix.
+    #
+    # Without (1), the only way to redirect the openai prefix away from
+    # api.openai.com was to edit config.yaml — but the platform doesn't
+    # surface provider_url in the canvas Config tab, so workspace
+    # secrets had no way to influence routing. Caught live during the
+    # 4-runtime A2A E2E (2026-05-03): MiniMax key on the openai prefix
+    # round-tripped to api.openai.com and 401'd.
     default_url = _PROVIDER_URLS.get(prefix, _PROVIDER_URLS["openai"])
-    if runtime_config is not None:
+    env_url = env.get(f"{prefix.upper()}_BASE_URL", "")
+    if env_url:
+        provider_url = env_url
+    elif runtime_config is not None:
         provider_url = runtime_config.get("provider_url", default_url)
     else:
         provider_url = default_url
