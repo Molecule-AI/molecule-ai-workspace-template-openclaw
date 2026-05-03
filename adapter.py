@@ -5,8 +5,12 @@ This adapter:
 1. Installs OpenClaw CLI (npm) and missing deps in the container
 2. Runs non-interactive onboard with the configured model provider
 3. Copies workspace files (SOUL.md, BOOTSTRAP.md, etc.) to OpenClaw's workspace dir
-4. Starts the OpenClaw gateway as a background process
-5. Proxies A2A messages via `openclaw agent --json` CLI subprocess
+4. Wires `molecule_runtime.a2a_mcp_server` as a stdio MCP server so the
+   agent can call `list_peers`, `delegate_task`, `commit_memory`, etc.
+   exactly like claude-code can — see ``_build_molecule_mcp_config`` /
+   ``_register_molecule_mcp`` below.
+5. Starts the OpenClaw gateway as a background process
+6. Proxies A2A messages via `openclaw agent --json` CLI subprocess
 """
 
 import asyncio
@@ -15,6 +19,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
 from molecule_runtime.adapters.shared_runtime import brief_task, extract_message_text, set_current_task
@@ -136,6 +141,140 @@ def _resolve_provider_routing(model_str, env, runtime_config=None):
     return prefix, model, provider_url, api_key
 
 
+# --- molecule a2a MCP wire-up --------------------------------------------
+#
+# claude-code gets the platform MCP for free via
+# ``claude_sdk_executor._build_options`` which injects an "a2a" MCP server
+# directly into ClaudeAgentOptions. openclaw runs Node-side and discovers
+# MCP servers from its own ``mcp.servers`` config block — set via
+# ``openclaw mcp set <name> '<json>'`` (cf. ``openclaw mcp --help``).
+#
+# Two concerns to get right:
+#
+# 1. **Env propagation.** openclaw uses the upstream MCP SDK's
+#    ``StdioClientTransport``, which calls ``getDefaultEnvironment()`` and
+#    only forwards an allowlist (HOME, PATH, SHELL, USER, TERM, LOGNAME).
+#    WORKSPACE_ID, PLATFORM_URL, MOLECULE_ORG_ID, CONFIGS_DIR are NOT in
+#    that list. We must pass them explicitly via the ``env:`` field of the
+#    server config — otherwise the MCP server would see WORKSPACE_ID=""
+#    and every /registry/peers call would 400.
+#
+# 2. **Resolution at write-time vs spawn-time.** ``openclaw mcp set``
+#    persists ``command``/``args``/``env`` literally. We resolve the
+#    Python interpreter (``sys.executable``) and a2a_mcp_server.py path
+#    (``get_mcp_server_path()``) at setup-time because both are stable
+#    inside the workspace container — the venv layout doesn't shift
+#    between provision and exec. Env values are resolved at setup-time
+#    too: WORKSPACE_ID and friends are baked into the workspace's
+#    /etc/environment by user-data well before adapter.setup() runs.
+#
+# Idempotent: ``openclaw mcp set`` overwrites entries by name. Re-running
+# setup() (e.g. on container restart) cleanly refreshes the entry.
+_MOLECULE_MCP_NAME = "molecule"
+_MCP_PASSTHROUGH_ENV_VARS = (
+    "WORKSPACE_ID",
+    "PLATFORM_URL",
+    "MOLECULE_ORG_ID",
+    "CONFIGS_DIR",
+    "A2A_MCP_SERVER_PATH",
+)
+
+
+def _build_molecule_mcp_config(env, *, mcp_server_path, python_executable):
+    """Build the JSON config dict for openclaw's ``mcp.servers.molecule``.
+
+    Mirrors claude_sdk_executor's mcp_servers entry — same script, same
+    interpreter, same auth surface — so peer enumeration / delegation /
+    memory tools behave identically across the two runtimes.
+
+    Pure: takes env (a Mapping) and the resolved paths so the test suite
+    can exercise it without subprocess calls or file IO.
+    """
+    payload = {
+        "command": python_executable,
+        "args": [mcp_server_path],
+    }
+    passthrough = {k: env[k] for k in _MCP_PASSTHROUGH_ENV_VARS if env.get(k)}
+    if passthrough:
+        payload["env"] = passthrough
+    return payload
+
+
+def _resolve_mcp_server_path():
+    """Return the on-disk path to ``molecule_runtime/a2a_mcp_server.py``.
+
+    Defers to ``executor_helpers.get_mcp_server_path()`` so this stays in
+    lockstep with claude_sdk_executor's resolution (legacy /app fallback,
+    A2A_MCP_SERVER_PATH override, etc.). Lazy-imported so the module load
+    here doesn't pin a specific molecule_runtime version at import time —
+    a workspace running an older runtime wheel without the helper still
+    boots cleanly, it just skips the MCP wire-up.
+    """
+    try:
+        from molecule_runtime.executor_helpers import get_mcp_server_path
+        return get_mcp_server_path()
+    except Exception:  # pragma: no cover — older runtime wheel
+        return None
+
+
+def _register_molecule_mcp(env=None):
+    """Register the molecule a2a MCP server with openclaw.
+
+    Returns True if the entry was written, False if skipped (missing
+    WORKSPACE_ID, no resolvable a2a_mcp_server, openclaw CLI failure).
+
+    Logs but does not raise: failure to wire MCP is degraded behaviour
+    (the agent runs without peer-discovery tools), not a fatal provision
+    failure. Crashing setup() here would block the workspace from
+    booting at all over what's effectively a feature flag.
+    """
+    env = env if env is not None else os.environ
+    if not env.get("WORKSPACE_ID"):
+        logger.info(
+            "molecule a2a MCP: WORKSPACE_ID not set — skipping MCP wire-up "
+            "(this is expected in dev / smoke runs)"
+        )
+        return False
+
+    mcp_path = _resolve_mcp_server_path()
+    if not mcp_path or not os.path.isfile(mcp_path):
+        logger.warning(
+            "molecule a2a MCP: a2a_mcp_server.py not found "
+            "(resolved=%r) — skipping MCP wire-up",
+            mcp_path,
+        )
+        return False
+
+    payload = _build_molecule_mcp_config(
+        env,
+        mcp_server_path=mcp_path,
+        python_executable=sys.executable,
+    )
+    try:
+        result = subprocess.run(
+            ["openclaw", "mcp", "set", _MOLECULE_MCP_NAME, json.dumps(payload)],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "NODE_NO_WARNINGS": "1"},
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("molecule a2a MCP: openclaw mcp set raised %s", exc)
+        return False
+
+    if result.returncode != 0:
+        logger.warning(
+            "molecule a2a MCP: openclaw mcp set failed (rc=%s, stderr=%s)",
+            result.returncode, (result.stderr or "")[:300],
+        )
+        return False
+
+    logger.info(
+        "molecule a2a MCP: registered '%s' → %s %s (env passthrough: %s)",
+        _MOLECULE_MCP_NAME, payload["command"], payload["args"][0],
+        sorted(payload.get("env", {}).keys()),
+    )
+    return True
+
+
 class OpenClawAdapter(BaseAdapter):
 
     def __init__(self):
@@ -253,6 +392,13 @@ class OpenClawAdapter(BaseAdapter):
             with open(auth_file, "w") as f:
                 json_mod.dump(auth_data, f, indent=2)
             logger.info(f"Wrote auth-profiles.json for {provider_name}")
+
+        # 3d. Wire molecule_runtime.a2a_mcp_server into openclaw so the
+        # agent has list_peers / delegate_task / commit_memory / etc. as
+        # MCP tools — same surface claude-code gets via claude_sdk_executor.
+        # Best-effort: failures here log but don't crash setup() (the
+        # workspace can still talk via direct A2A subprocess fallbacks).
+        _register_molecule_mcp(os.environ)
 
         # 4. Copy workspace files from /configs to OpenClaw's workspace dir
         os.makedirs(OPENCLAW_WORKSPACE, exist_ok=True)
