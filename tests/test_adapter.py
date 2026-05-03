@@ -417,3 +417,111 @@ async def test_cancel_with_active_run_fires_abort():
     _, params = aborts[0]
     assert params["key"] == OpenClawA2AExecutor._SESSION_KEY
     assert params["runId"] == "run-cancel-me"
+
+
+# ---- ConnectionError / WS-dropped recovery (#27 follow-up) ------------
+
+
+@pytest.mark.asyncio
+async def test_executor_resets_gateway_on_connection_error_during_send():
+    """When sessions.send raises ConnectionError (WS died), the
+    executor must:
+      1. Clear `self._gateway` so the next execute() reconnects.
+      2. Clear `self._active_run_id` so the next execute() starts
+         a fresh send (not steer against a dead run).
+      3. Return a recover-friendly error string mentioning retry.
+
+    Without (1), the cached closed client persists — every subsequent
+    execute() returns the cached gateway from `_ensure_gateway()` and
+    fails identically. Workspace wedges invisibly. #27 (c).
+    """
+    fake = _FakeGateway()
+    fake.raise_on["sessions.send"] = ConnectionError("gateway WS closed")
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    executor._gateway = fake
+    executor._active_run_id = None  # no active run; will hit send
+
+    queue = _CapturingQueue()
+    await executor.execute(_ctx("hi"), queue)
+
+    # State reset so next call retries.
+    assert executor._gateway is None, (
+        "gateway cache must clear on ConnectionError so next execute reconnects"
+    )
+    assert executor._active_run_id is None
+    text = _event_text(queue.events[0])
+    assert "OpenClaw gateway disconnected" in text
+    assert "Retry" in text
+
+
+@pytest.mark.asyncio
+async def test_executor_resets_gateway_on_connection_error_during_steer():
+    """Same recovery contract for the steer path. ConnectionError
+    raised during sessions.steer (mid-flight steer call when the
+    WS dies) clears the cache + active_run_id."""
+    fake = _FakeGateway()
+    fake.raise_on["sessions.steer"] = ConnectionError("WS dropped mid-steer")
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    executor._gateway = fake
+    executor._active_run_id = "run-X"  # active → steer path
+
+    queue = _CapturingQueue()
+    await executor.execute(_ctx("steered"), queue)
+
+    assert executor._gateway is None
+    assert executor._active_run_id is None
+    assert "disconnected" in _event_text(queue.events[0])
+
+
+@pytest.mark.asyncio
+async def test_executor_resets_gateway_on_connection_error_during_wait():
+    """ConnectionError during agent.wait (the long-blocking call most
+    likely to hit a server restart) clears the cache + active_run_id."""
+    fake = _FakeGateway()
+    fake.raise_on["agent.wait"] = ConnectionError("server restart mid-wait")
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    executor._gateway = fake
+
+    queue = _CapturingQueue()
+    await executor.execute(_ctx("question"), queue)
+
+    assert executor._gateway is None
+    assert executor._active_run_id is None
+    assert "disconnected" in _event_text(queue.events[0])
+
+
+@pytest.mark.asyncio
+async def test_executor_does_not_clobber_cache_when_replaced_underneath():
+    """Defensive: if a concurrent execute() replaces self._gateway
+    between our request() and our cache-clear, we must NOT clobber the
+    new client. The reset only happens when self._gateway IS the same
+    object that just raised."""
+    old_fake = _FakeGateway()
+    new_fake = _FakeGateway()
+    old_fake.raise_on["sessions.send"] = ConnectionError("old WS dropped")
+
+    executor = OpenClawA2AExecutor(heartbeat=None)
+    executor._gateway = old_fake
+
+    # Simulate the concurrent-replacement race: just before our
+    # cache-clear runs, swap in the new client (as if another coroutine
+    # already detected the disconnect and reconnected).
+    original_request = old_fake.request
+    swap_done = False
+
+    async def swap_then_raise(method, params=None, *, timeout=None):
+        nonlocal swap_done
+        if method == "sessions.send" and not swap_done:
+            executor._gateway = new_fake
+            swap_done = True
+        return await original_request(method, params, timeout=timeout)
+
+    old_fake.request = swap_then_raise
+
+    queue = _CapturingQueue()
+    await executor.execute(_ctx("racy"), queue)
+
+    # The new client must NOT have been clobbered to None.
+    assert executor._gateway is new_fake, (
+        "cache reset must only fire when the dropped client IS the cached one"
+    )
