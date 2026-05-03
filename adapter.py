@@ -14,12 +14,15 @@ This adapter:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import uuid
+from contextlib import suppress as contextlib_suppress
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
 from molecule_runtime.adapters.shared_runtime import brief_task, extract_message_text, set_current_task
@@ -275,39 +278,11 @@ def _register_molecule_mcp(env=None):
     return True
 
 
-def _extract_assistant_text(data):
-    """Pull the user-visible reply out of an `openclaw agent --json` response.
-
-    The CLI emits a top-level dict shaped like::
-
-        {"payloads": [{"text": "...", "mediaUrl": null}, ...],
-         "meta": {"finalAssistantVisibleText": "...", ...}}
-
-    There is NO `result` wrapper around `payloads` (a previous version of
-    this adapter looked under `data["result"]["payloads"]`, found nothing,
-    and silently fell back to ``str(data)`` — which dumped the entire
-    envelope, including the bootstrap prompt and provider metadata, into
-    the canvas chat as the assistant's reply).
-
-    Multi-payload turns (e.g. an interim "Let me check!" followed by the
-    actual answer after a tool call) are joined with a blank line so the
-    user sees both messages in order.
-
-    Returns the empty string when the dict has no recognizable text — the
-    caller treats that as "use the raw stdout instead" rather than
-    surfacing the dict.
-    """
-    payloads = data.get("payloads") if isinstance(data, dict) else None
-    if isinstance(payloads, list):
-        texts = [p.get("text", "") for p in payloads if isinstance(p, dict) and p.get("text")]
-        if texts:
-            return "\n\n".join(texts)
-    meta = data.get("meta") if isinstance(data, dict) else None
-    if isinstance(meta, dict):
-        visible = meta.get("finalAssistantVisibleText")
-        if isinstance(visible, str) and visible:
-            return visible
-    return ""
+# NB: the legacy `_extract_assistant_text` (parser for the
+# `openclaw agent --json` CLI envelope) was removed when execute()
+# switched to the gateway-WS path. Gateway responses arrive as
+# transcript messages via chat.history, not the CLI envelope shape.
+# The replacement is `_assistant_text_from_history` (defined below).
 
 
 class OpenClawAdapter(BaseAdapter):
@@ -477,10 +452,72 @@ class OpenClawAdapter(BaseAdapter):
 
 
 class OpenClawA2AExecutor(AgentExecutor):
-    """Proxies A2A messages to OpenClaw via `openclaw agent` CLI subprocess."""
+    """Proxies A2A messages to the OpenClaw gateway via WebSocket RPCs.
 
-    def __init__(self, heartbeat=None):
+    Replaces the prior ``openclaw agent --local`` subprocess shell-out
+    so we get push parity with claude-code / hermes / codex:
+
+      * ``--local`` is a one-shot embedded agent (per docs/cli/agent.md)
+        that bypasses the gateway, has no session continuity, and offers
+        no mid-turn interrupt primitive.
+      * Going through the gateway gives us ``sessions.send`` for the
+        first message and **``sessions.steer``** to inject mid-turn
+        prompts into an active run — same shape as codex's ``turn/steer``.
+
+    The prior comment about ``--local`` being needed because "gateway
+    requires pairing" conflated node-pairing (WS-node role, requires
+    UI approval) with operator-mode connect (control-plane role, no
+    pairing). We connect as ``operator`` on the loopback gateway started
+    by setup() — ``--bind loopback`` + ``--dev`` mean trusted-loopback
+    auth is sufficient.
+
+    Single-session model: all A2A messages route to one session
+    (``agent:main:default``). Per-peer sessions could come later but
+    require sessions.create + per-key tracking; the single-session
+    model captures the push-parity win while keeping diff small.
+    """
+
+    # All A2A messages route to this session. The agent sees the peer's
+    # workspace_id / canvas-user identifier in the message body itself.
+    # Per-peer sessions would require sessions.create + a peer→key map;
+    # tracked separately as a future improvement.
+    _SESSION_KEY = "agent:main:default"
+
+    # Wait deadline for the run completing — matches the prior
+    # subprocess --timeout 120 semantics.
+    _RUN_WAIT_TIMEOUT_MS = 120_000
+
+    def __init__(self, heartbeat=None, *, gateway_port: int = OPENCLAW_PORT):
         self._heartbeat = heartbeat
+        self._gateway_port = gateway_port
+        self._gateway = None  # GatewayClient | None — lazy init
+        self._gateway_lock = asyncio.Lock()
+        # Track the currently-active run (if any) so a mid-flight
+        # arrival fires sessions.steer instead of sessions.send.
+        self._active_run_id: str | None = None
+        self._active_run_lock = asyncio.Lock()
+
+    async def _ensure_gateway(self):
+        """Lazy-init the WS connection on first execute()."""
+        if self._gateway is not None:
+            return self._gateway
+        async with self._gateway_lock:
+            if self._gateway is not None:
+                return self._gateway
+            from gateway_client import GatewayClient
+
+            client = GatewayClient(url=f"ws://127.0.0.1:{self._gateway_port}/")
+            try:
+                await client.connect(scopes=["operator.write"], timeout=15.0)
+            except Exception:
+                # Don't keep a half-initialized client around — next
+                # execute() retries the connect.
+                with contextlib_suppress(Exception):
+                    await client.close()
+                raise
+            self._gateway = client
+            logger.info("openclaw gateway WS connected on port %d", self._gateway_port)
+            return self._gateway
 
     async def execute(self, context, event_queue):
         from molecule_runtime.executor_helpers import new_response_message
@@ -492,50 +529,154 @@ class OpenClawA2AExecutor(AgentExecutor):
             return
 
         await set_current_task(self._heartbeat, brief_task(user_message))
-
-        # Call OpenClaw agent via CLI in --local (embedded) mode. The
-        # default path goes through the gateway, which requires a paired
-        # device and explicit scope-upgrade approvals — both interactive
-        # flows that don't fit a headless EC2 workspace. --local bypasses
-        # the gateway entirely and runs the embedded agent against the
-        # configured provider/key, exactly the surface our setup() prepped
-        # via auth-profiles.json + openclaw onboard. Pairing requirement
-        # discovered live during 2026-05-03 4-runtime A2A E2E (`scope
-        # upgrade pending approval` + `pairing required: device is asking
-        # for more scopes than ...`).
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "openclaw", "agent", "--local",
-                "--session-id", context.task_id or "default",
-                "--message", user_message,
-                "--json", "--timeout", "120",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "PATH": f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"}
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=130)
-            output = stdout.decode().strip()
-
-            if proc.returncode == 0 and output:
-                try:
-                    data = json.loads(output)
-                    reply = _extract_assistant_text(data) or output
-                except json.JSONDecodeError:
-                    reply = output
-            else:
-                reply = f"OpenClaw error: {stderr.decode()[:300]}" if stderr else f"OpenClaw returned code {proc.returncode}"
-
-        except asyncio.TimeoutError:
-            reply = "OpenClaw timed out after 120s"
-        except Exception as e:
-            reply = f"OpenClaw error: {e}"
+            reply = await self._dispatch(user_message)
         finally:
             await set_current_task(self._heartbeat, "")
 
         await event_queue.enqueue_event(new_response_message(context, reply))
 
+    async def _dispatch(self, user_message: str) -> str:
+        """Route the message: steer if a run is active, else send + wait."""
+        from gateway_client import GatewayError
+
+        try:
+            gw = await self._ensure_gateway()
+        except Exception as exc:  # noqa: BLE001
+            return f"OpenClaw gateway connect failed: {exc}"
+
+        # Push parity: when a run is already in flight for this session,
+        # inject the new message via sessions.steer instead of waiting
+        # on the prior run to finish. The agent sees both prompts in
+        # one coherent context. This execute()'s response shape is a
+        # short status placeholder — the agent's substantive reply lands
+        # via the in-flight run's response (delivered on the original
+        # execute()'s event_queue).
+        async with self._active_run_lock:
+            steering = self._active_run_id is not None
+
+        if steering:
+            try:
+                await gw.request(
+                    "sessions.steer",
+                    {
+                        "key": self._SESSION_KEY,
+                        "message": user_message,
+                        "idempotencyKey": f"steer-{uuid.uuid4().hex}",
+                    },
+                    timeout=10.0,
+                )
+                logger.info("openclaw push: steered into active run")
+                return (
+                    "[steered into in-flight openclaw run — agent reply "
+                    "will be delivered via the original run's response]"
+                )
+            except (GatewayError, asyncio.TimeoutError) as exc:
+                # Steer failed (no active run / not steerable / transport
+                # hiccup). Fall through to start a new run.
+                logger.debug("openclaw steer failed (%s) — falling through to send", exc)
+                async with self._active_run_lock:
+                    self._active_run_id = None
+
+        # Start a new run via sessions.send.
+        idempotency_key = f"send-{uuid.uuid4().hex}"
+        try:
+            send_resp = await gw.request(
+                "sessions.send",
+                {
+                    "key": self._SESSION_KEY,
+                    "message": user_message,
+                    "idempotencyKey": idempotency_key,
+                },
+                timeout=15.0,
+            )
+        except (GatewayError, asyncio.TimeoutError) as exc:
+            return f"OpenClaw sessions.send failed: {exc}"
+
+        run_id = send_resp.get("runId")
+        if not isinstance(run_id, str):
+            return f"OpenClaw sessions.send returned no runId: {send_resp!r}"
+
+        async with self._active_run_lock:
+            self._active_run_id = run_id
+        try:
+            try:
+                await gw.request(
+                    "agent.wait",
+                    {"runId": run_id, "timeoutMs": self._RUN_WAIT_TIMEOUT_MS},
+                    timeout=(self._RUN_WAIT_TIMEOUT_MS / 1000) + 10.0,
+                )
+            except (GatewayError, asyncio.TimeoutError) as exc:
+                return f"OpenClaw run {run_id} did not finish: {exc}"
+
+            # Pull the latest assistant message from the transcript.
+            try:
+                hist = await gw.request(
+                    "chat.history",
+                    {"sessionKey": self._SESSION_KEY, "limit": 5},
+                    timeout=10.0,
+                )
+            except (GatewayError, asyncio.TimeoutError) as exc:
+                return f"OpenClaw chat.history failed: {exc}"
+
+            text = _assistant_text_from_history(hist)
+            return text or "(openclaw produced no assistant text)"
+        finally:
+            async with self._active_run_lock:
+                if self._active_run_id == run_id:
+                    self._active_run_id = None
+
     async def cancel(self, context, event_queue):  # pragma: no cover
-        pass
+        # Best-effort: abort the active run via sessions.abort.
+        if self._gateway is None:
+            return
+        async with self._active_run_lock:
+            run_id = self._active_run_id
+        if run_id is None:
+            return
+        from gateway_client import GatewayError
+
+        try:
+            await self._gateway.request(
+                "sessions.abort",
+                {"key": self._SESSION_KEY, "runId": run_id},
+                timeout=5.0,
+            )
+        except (GatewayError, asyncio.TimeoutError, ConnectionError) as exc:
+            logger.debug("openclaw sessions.abort failed (likely already done): %s", exc)
+
+
+def _assistant_text_from_history(history: dict) -> str:
+    """Pull the most recent assistant message text out of a
+    ``chat.history`` response.
+
+    The gateway's chat.history is display-normalized: tool-call XML
+    payloads stripped, control tokens stripped, NO_REPLY rows omitted.
+    Schema: ``{ messages: [{ role, content: [{type:"text",text}], ...}, ...] }``.
+    Order is chronological by default; we walk from the end to find the
+    most recent ``role: assistant`` row with non-empty text.
+    """
+    messages = history.get("messages") if isinstance(history, dict) else None
+    if not isinstance(messages, list):
+        return ""
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            parts = [
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            joined = "\n\n".join(s for s in parts if s)
+            if joined:
+                return joined
+    return ""
 
 
 Adapter = OpenClawAdapter
