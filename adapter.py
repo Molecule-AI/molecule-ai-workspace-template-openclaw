@@ -275,6 +275,41 @@ def _register_molecule_mcp(env=None):
     return True
 
 
+def _extract_assistant_text(data):
+    """Pull the user-visible reply out of an `openclaw agent --json` response.
+
+    The CLI emits a top-level dict shaped like::
+
+        {"payloads": [{"text": "...", "mediaUrl": null}, ...],
+         "meta": {"finalAssistantVisibleText": "...", ...}}
+
+    There is NO `result` wrapper around `payloads` (a previous version of
+    this adapter looked under `data["result"]["payloads"]`, found nothing,
+    and silently fell back to ``str(data)`` — which dumped the entire
+    envelope, including the bootstrap prompt and provider metadata, into
+    the canvas chat as the assistant's reply).
+
+    Multi-payload turns (e.g. an interim "Let me check!" followed by the
+    actual answer after a tool call) are joined with a blank line so the
+    user sees both messages in order.
+
+    Returns the empty string when the dict has no recognizable text — the
+    caller treats that as "use the raw stdout instead" rather than
+    surfacing the dict.
+    """
+    payloads = data.get("payloads") if isinstance(data, dict) else None
+    if isinstance(payloads, list):
+        texts = [p.get("text", "") for p in payloads if isinstance(p, dict) and p.get("text")]
+        if texts:
+            return "\n\n".join(texts)
+    meta = data.get("meta") if isinstance(data, dict) else None
+    if isinstance(meta, dict):
+        visible = meta.get("finalAssistantVisibleText")
+        if isinstance(visible, str) and visible:
+            return visible
+    return ""
+
+
 class OpenClawAdapter(BaseAdapter):
 
     def __init__(self):
@@ -484,11 +519,7 @@ class OpenClawA2AExecutor(AgentExecutor):
             if proc.returncode == 0 and output:
                 try:
                     data = json.loads(output)
-                    payloads = data.get("result", {}).get("payloads", [])
-                    if payloads:
-                        reply = payloads[0].get("text", "")
-                    else:
-                        reply = str(data)
+                    reply = _extract_assistant_text(data) or output
                 except json.JSONDecodeError:
                     reply = output
             else:
