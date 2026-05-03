@@ -50,6 +50,18 @@ class _CapturingQueue:
         self.events.append(event)
 
 
+def _event_text(event: Any) -> str:
+    """Pull the exact text out of an a2a Message — `event.parts[0].text`.
+
+    Tests previously matched on `repr(event)`, which is too loose: the
+    raw JSON envelope contains the assistant text as a substring even
+    when the extractor failed and we fell back to `output` (the JSON
+    string). Comparing exact text catches that drift instead of hiding
+    it.
+    """
+    return event.parts[0].text
+
+
 def _ctx(text: str, *, task_id: str = "task-A"):
     """Stand up a context that extract_message_text(context) will read.
 
@@ -144,7 +156,11 @@ async def test_executor_happy_path_extracts_payload_text(monkeypatch):
     await executor.execute(_ctx("ping"), queue)
 
     assert len(queue.events) == 1
-    assert "openclaw answered: 42" in repr(queue.events[0])
+    # Exact equality, not substring-in-repr: a substring check would still
+    # pass if the extractor silently fell back to `output` (the raw JSON
+    # string), which contains the literal text inside the `payloads`
+    # array. Comparing exact event text catches that drift.
+    assert _event_text(queue.events[0]) == "openclaw answered: 42"
     # Subprocess was invoked with the expected fixed flags. --local
     # bypasses the openclaw gateway (which requires interactive device
     # pairing + scope-upgrade approval) and runs the embedded agent
@@ -169,7 +185,7 @@ async def test_executor_empty_message_short_circuits(monkeypatch):
     await executor.execute(_ctx(""), queue)
 
     assert len(queue.events) == 1
-    assert "No message provided" in repr(queue.events[0])
+    assert _event_text(queue.events[0]) == "No message provided"
     assert calls == []  # subprocess NOT spawned
 
 
@@ -195,9 +211,11 @@ async def test_executor_concatenates_multiple_payloads(monkeypatch):
     queue = _CapturingQueue()
     await executor.execute(_ctx("hi"), queue)
 
-    text = repr(queue.events[0])
-    assert "Let me check!" in text
-    assert "codex and hermes are online" in text
+    # Exact equality on the joined output — a substring-in-repr would
+    # still pass if extraction failed and the raw JSON dropped both
+    # texts as substrings inside the dumped envelope.
+    assert _event_text(queue.events[0]) == \
+        "Let me check!\n\nYep — codex and hermes are online."
 
 
 @pytest.mark.asyncio
@@ -212,9 +230,9 @@ async def test_executor_falls_back_to_meta_visible_text_when_no_payloads(monkeyp
     queue = _CapturingQueue()
     await executor.execute(_ctx("hi"), queue)
 
-    text = repr(queue.events[0])
-    assert "rendered reply" in text
-    # Regression: meta envelope should NOT leak.
+    text = _event_text(queue.events[0])
+    assert text == "rendered reply"
+    # Regression: meta envelope key name should NOT leak into the reply.
     assert "finalAssistantVisibleText" not in text
 
 
@@ -241,8 +259,11 @@ async def test_executor_does_not_leak_envelope_dict(monkeypatch):
     queue = _CapturingQueue()
     await executor.execute(_ctx("hi"), queue)
 
-    text = repr(queue.events[0])
-    assert "the only thing the user should see" in text
+    text = _event_text(queue.events[0])
+    # Exact equality: the reply must be ONLY the payload text — no
+    # envelope spillover, no field-name labels, no surrounding dict
+    # punctuation.
+    assert text == "the only thing the user should see"
     for leaked_field in ("sessionId", "systemPromptReport", "agentMeta",
                          "secret-session-id", "custom-api-minimax-io"):
         assert leaked_field not in text, \
@@ -260,7 +281,7 @@ async def test_executor_falls_back_to_raw_output_on_invalid_json(monkeypatch):
     queue = _CapturingQueue()
     await executor.execute(_ctx("hi"), queue)
 
-    assert "not json at all" in repr(queue.events[0])
+    assert _event_text(queue.events[0]) == "not json at all"
 
 
 # ---- executor: error paths ------------------------------------------
