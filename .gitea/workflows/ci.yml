@@ -1,0 +1,5 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  validate:
+    uses: molecule-ai/molecule-ci/.gitea/workflows/validate-workspace-template.yml@main

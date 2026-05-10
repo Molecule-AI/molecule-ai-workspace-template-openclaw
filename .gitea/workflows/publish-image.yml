@@ -52,7 +52,7 @@ jobs:
 
   publish:
     needs: resolve-version
-    uses: Molecule-AI/molecule-ci/.github/workflows/publish-template-image.yml@main
+    uses: molecule-ai/molecule-ci/.gitea/workflows/publish-template-image.yml@main
     secrets: inherit
     with:
       # Cascade fires with client_payload.runtime_version = the exact
