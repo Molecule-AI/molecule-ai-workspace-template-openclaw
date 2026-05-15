@@ -13,8 +13,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
 from molecule_runtime.adapters.shared_runtime import brief_task, extract_message_text, set_current_task
@@ -31,6 +34,85 @@ OPENCLAW_PROVIDERS = {
     "minimax":    (("MINIMAX_API_KEY",),                    "https://api.minimaxi.com/v1"),
     "moonshot":   (("KIMI_API_KEY",),                       "https://api.moonshot.ai/v1"),
 }
+
+# MiniMax token-plan contract — see
+# https://platform.minimax.io/docs/token-plan/openclaw and
+# https://platform.minimax.io/docs/token-plan/claude-code.
+#
+# When MINIMAX_API_KEY carries a MiniMax-ISSUED token (the `sk-cp-*`
+# shape sold via the "token plan" billing tier), the upstream is not the
+# legacy OpenAI-compat surface at api.minimaxi.com/v1. Instead, MiniMax
+# routes those tokens through their Anthropic-compatible gateway at
+# api.minimax.io/anthropic and expects the consumer to speak the
+# Anthropic Messages API.
+#
+# OpenClaw's onboard --custom-base-url / --custom-compatibility path
+# wires onboard's OpenAI-compat client, which is the WRONG shape for
+# `sk-cp-*`. The right surface is the Anthropic SDK shim inside
+# openclaw: it reads ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN from the
+# environment on every request, so setting those before the gateway
+# spawns is sufficient. The other env vars below are documented
+# defaults from MiniMax — they avoid surprises around timeouts and
+# model-name pinning.
+#
+# This routing applies ONLY when:
+#   - the configured model is MiniMax-family, AND
+#   - the resolved api_key matches the `sk-cp-*` shape.
+# Real native MiniMax JWTs and unrelated providers fall through to the
+# legacy OpenAI-compat path untouched.
+MINIMAX_ANTHROPIC_BASE_URL = "https://api.minimax.io/anthropic"
+MINIMAX_TOKEN_PLAN_KEY_RE = re.compile(r"^sk-cp-[A-Za-z0-9_\-]+$")
+
+
+def _is_minimax_model(model: str) -> bool:
+    """True if the configured model name belongs to the MiniMax family.
+
+    Accepts both the platform's `minimax:<id>` prefix shape (what the
+    canvas writes) and the bare `MiniMax-*` / `minimax-*` id shape used
+    by the MiniMax docs and openclaw's model picker. Case-insensitive on
+    the bare prefix to tolerate canvas-vs-docs casing drift.
+    """
+    if not model:
+        return False
+    m = model.lower()
+    return m.startswith("minimax:") or m.startswith("minimax-") or m.startswith("minimax/")
+
+
+def _is_token_plan_key(api_key: str | None) -> bool:
+    """True if `api_key` matches MiniMax's `sk-cp-*` token-plan shape."""
+    return bool(api_key) and bool(MINIMAX_TOKEN_PLAN_KEY_RE.match(api_key))
+
+
+def _probe_minimax_anthropic_endpoint(api_key: str, model: str) -> tuple[int, str]:
+    """Send a 1-token messages request to the MiniMax Anthropic gateway.
+
+    Returns (http_status, body_head). Surfaces network errors as
+    (0, "<exception>") so the caller can fail fast before the gateway
+    spawns instead of paying the full 7-minute cold-start before the
+    user sees the 401.
+    """
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ok"}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{MINIMAX_ANTHROPIC_BASE_URL}/v1/messages",
+        data=body,
+        method="POST",
+        headers={
+            "anthropic-version": "2023-06-01",
+            "x-api-key": api_key,
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.read(200).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(200).decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, repr(e)
 
 OPENCLAW_WORKSPACE = os.path.expanduser("~/.openclaw/workspace-dev/main")
 OPENCLAW_PORT = 18789
@@ -106,26 +188,118 @@ class OpenClawAdapter(BaseAdapter):
             config.model, os.environ, registry=OPENCLAW_PROVIDERS, runtime_config=config.runtime_config
         )
 
-        # 3. Run non-interactive onboard
+        # 2b. Detect MiniMax token-plan (`sk-cp-*`) routing.
+        #
+        # If the configured model is MiniMax-family AND the resolved key
+        # is a token-plan key, override the upstream surface to MiniMax's
+        # Anthropic-compatible gateway. The Anthropic SDK shim inside
+        # openclaw picks up ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
+        # from the environment on every request, so we don't need (and
+        # don't want) the `openclaw onboard --custom-base-url` flag —
+        # that wires the OpenAI-compat client, which is the wrong shape.
+        # See module-level docstring for the upstream MiniMax docs links
+        # and the env-var contract this implements.
+        use_minimax_token_plan = (
+            _is_minimax_model(model) and _is_token_plan_key(api_key)
+        )
+        if use_minimax_token_plan:
+            # Pin the model name to what MiniMax's Anthropic gateway
+            # actually serves. The token-plan endpoint only recognises a
+            # narrow MiniMax-* slug set; the raw canvas value may carry
+            # an `openrouter/...` or `minimax:` prefix that the gateway
+            # rejects with 400. Default to the docs-recommended slug;
+            # callers can override via runtime_config.anthropic_model.
+            mm_model = (
+                config.runtime_config.get("anthropic_model")
+                or "MiniMax-M2.7"
+            )
+            mm_env = {
+                "ANTHROPIC_BASE_URL": MINIMAX_ANTHROPIC_BASE_URL,
+                "ANTHROPIC_AUTH_TOKEN": api_key,
+                # 50 min — covers MiniMax cold-start + long tool chains.
+                "API_TIMEOUT_MS": "3000000",
+                # Don't leak telemetry/anon-id pings to anthropic.com.
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "ANTHROPIC_MODEL": mm_model,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": mm_model,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": mm_model,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": mm_model,
+            }
+            os.environ.update(mm_env)
+            logger.info(
+                "MiniMax token-plan (sk-cp-*) detected for model=%s; "
+                "routing via Anthropic gateway %s (model=%s)",
+                model, MINIMAX_ANTHROPIC_BASE_URL, mm_model,
+            )
+
+            # Fail fast: probe the endpoint with the resolved key BEFORE
+            # spawning the gateway. A 401 here means the token is
+            # invalid; surfacing that as a setup failure beats waiting
+            # ~7 min for cold-start + a confusing in-chat error.
+            status, body_head = _probe_minimax_anthropic_endpoint(api_key, mm_model)
+            if status == 401:
+                raise RuntimeError(
+                    f"MiniMax token-plan probe returned 401 (auth failure). "
+                    f"The configured MINIMAX_API_KEY is invalid for the "
+                    f"Anthropic-compat surface at {MINIMAX_ANTHROPIC_BASE_URL}. "
+                    f"Response: {body_head[:200]}"
+                )
+            if status == 0:
+                # Network failure — log and continue. The gateway will
+                # retry on its own once the workspace has connectivity.
+                logger.warning(
+                    "MiniMax token-plan probe could not reach %s: %s. "
+                    "Continuing setup; openclaw will retry on first agent call.",
+                    MINIMAX_ANTHROPIC_BASE_URL, body_head,
+                )
+            else:
+                logger.info(
+                    "MiniMax token-plan probe to %s returned HTTP %d (non-401 = auth OK).",
+                    MINIMAX_ANTHROPIC_BASE_URL, status,
+                )
+
+        # 3. Run non-interactive onboard.
+        #
+        # For the MiniMax token-plan path we still run onboard so the
+        # local openclaw state dir is initialised (paired.json, devices,
+        # etc.), but we DO NOT pass --custom-base-url / --custom-model-id
+        # / --custom-compatibility — those wire the OpenAI-compat
+        # client and would override the Anthropic SDK shim's env-var
+        # routing. Onboard runs with the env vars already in scope so
+        # the shim picks them up for any onboard-time probes too.
         if not os.path.exists(os.path.expanduser("~/.openclaw/openclaw.json")):
             logger.info(f"Running OpenClaw onboard (model: {model})...")
+            if use_minimax_token_plan:
+                onboard_cmd = [
+                    "openclaw", "onboard", "--non-interactive",
+                    "--auth-choice", "anthropic-env",
+                    "--secret-input-mode", "plaintext",
+                    "--accept-risk", "--skip-health",
+                ]
+            else:
+                onboard_cmd = [
+                    "openclaw", "onboard", "--non-interactive",
+                    "--auth-choice", "custom-api-key",
+                    "--custom-base-url", provider_url,
+                    "--custom-model-id", model,
+                    "--custom-api-key", api_key,
+                    "--custom-compatibility", "openai",
+                    "--secret-input-mode", "plaintext",
+                    "--accept-risk", "--skip-health",
+                ]
             subprocess.run(
-                ["openclaw", "onboard", "--non-interactive",
-                 "--auth-choice", "custom-api-key",
-                 "--custom-base-url", provider_url,
-                 "--custom-model-id", model,
-                 "--custom-api-key", api_key,
-                 "--custom-compatibility", "openai",
-                 "--secret-input-mode", "plaintext",
-                 "--accept-risk", "--skip-health"],
+                onboard_cmd,
                 capture_output=True, text=True, timeout=60,
                 env={**os.environ, "NODE_NO_WARNINGS": "1"}
             )
             logger.info("OpenClaw onboard complete")
 
-        # 3b. Fix context window (OpenClaw defaults to 16K, but modern models have much more)
+        # 3b. Fix context window (OpenClaw defaults to 16K, but modern models have much more).
+        # Skip on the MiniMax token-plan path — the Anthropic SDK shim
+        # doesn't read openclaw's per-provider model registry; context
+        # window is determined by the upstream model card at MiniMax.
         oc_config_path = os.path.expanduser("~/.openclaw/openclaw.json")
-        if os.path.exists(oc_config_path):
+        if os.path.exists(oc_config_path) and not use_minimax_token_plan:
             try:
                 import json as json_mod
                 oc_cfg = json_mod.load(open(oc_config_path))
@@ -141,8 +315,12 @@ class OpenClawAdapter(BaseAdapter):
                 logger.warning(f"Failed to fix context window: {e}")
 
         # 3c. Always write auth-profiles.json
-        # (key may have been set via secrets API after first boot)
-        if api_key:
+        # (key may have been set via secrets API after first boot).
+        # Skip on the MiniMax token-plan path — auth flows entirely
+        # through ANTHROPIC_AUTH_TOKEN, not openclaw's per-provider
+        # api-key registry. Writing the wrong-shape entry here would
+        # confuse openclaw's provider picker at next boot.
+        if api_key and not use_minimax_token_plan:
             auth_dir = os.path.expanduser("~/.openclaw/agents/main/agent")
             os.makedirs(auth_dir, exist_ok=True)
             auth_file = os.path.join(auth_dir, "auth-profiles.json")
