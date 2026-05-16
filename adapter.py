@@ -63,6 +63,54 @@ OPENCLAW_PROVIDERS = {
 MINIMAX_ANTHROPIC_BASE_URL = "https://api.minimax.io/anthropic"
 MINIMAX_TOKEN_PLAN_KEY_RE = re.compile(r"^sk-cp-[A-Za-z0-9_\-]+$")
 
+# Kimi For Coding (Moonshot AI) — see https://platform.kimi.ai/docs/guide/agent-support.
+#
+# Moonshot ships TWO API surfaces under the same brand:
+#   1. The legacy general-purpose Moonshot API at
+#      https://api.moonshot.ai/v1 (and the China-region twin
+#      api.moonshot.cn/v1). Keys are minted at platform.moonshot.cn,
+#      shape is `sk-<opaque>`, and the gateway speaks OpenAI-compat
+#      (chat/completions) plus an Anthropic-compat shim at
+#      `/anthropic/v1/messages`.
+#   2. The newer "Kimi For Coding" tier at https://api.kimi.com/coding/
+#      — a separate product targeted at coding agents (Claude Code,
+#      Kimi CLI, RooCode, Kilo Code, openclaw). Keys are minted at
+#      platform.kimi.ai/console/api-keys, shape is `sk-kimi-<opaque>`,
+#      and the ONLY served model is `kimi-for-coding` (Kimi K2.6).
+#      The gateway speaks Anthropic Messages API at
+#      `/coding/v1/messages` (NOT `/coding/anthropic/v1/messages`!) and
+#      additionally gates on User-Agent — only coding-agent UAs are
+#      accepted (verified live 2026-05-15: `kimi-cli/*` and
+#      `roo-cline/*` UAs return 403 "Kimi For Coding is currently only
+#      available for Coding Agents such as Kimi CLI, Claude Code, …";
+#      `claude-cli/*` returns 200). OpenClaw's Anthropic SDK shim
+#      defaults to a `claude-cli/<version>` UA so it satisfies that
+#      gate without any extra config on our side.
+#
+# A `sk-kimi-*` key cannot authenticate against the legacy
+# api.moonshot.ai surfaces — every probe path (chat/completions,
+# /v1/models, /anthropic/v1/messages) returned 401
+# `invalid_authentication_error`. OpenClaw's
+# OPENCLAW_PROVIDERS["moonshot"] points at api.moonshot.ai/v1, so a
+# user picking a Kimi model + supplying a `sk-kimi-*` key would always
+# 401 via the legacy openclaw onboard --custom-* path. We treat
+# `sk-kimi-*` exactly like MiniMax's `sk-cp-*`: a Molecule-CP-issued
+# upstream token whose only valid surface is an Anthropic-compatible
+# gateway, wired via ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN.
+#
+# Routing applies ONLY when:
+#   - the configured model is Moonshot/Kimi-family, AND
+#   - the resolved api_key matches the `sk-kimi-*` shape.
+# Native Moonshot `sk-*` keys keep the legacy OpenAI-compat path.
+KIMI_CODING_ANTHROPIC_BASE_URL = "https://api.kimi.com/coding"
+KIMI_CODING_KEY_RE = re.compile(r"^sk-kimi-[A-Za-z0-9_\-]+$")
+# Single served model on the Kimi-For-Coding gateway today. Pinned here
+# because the canvas surfaces shapes like `moonshot:kimi-k2`,
+# `kimi-coding/kimi-k2`, or bare `kimi-k2.6` — none of which the gateway
+# accepts directly. Caller can override via runtime_config.anthropic_model
+# once Moonshot ships a multi-model coding tier.
+KIMI_CODING_MODEL = "kimi-for-coding"
+
 
 def _is_minimax_model(model: str) -> bool:
     """True if the configured model name belongs to the MiniMax family.
@@ -78,9 +126,46 @@ def _is_minimax_model(model: str) -> bool:
     return m.startswith("minimax:") or m.startswith("minimax-") or m.startswith("minimax/")
 
 
+def _is_kimi_model(model: str) -> bool:
+    """True if the configured model name belongs to the Moonshot/Kimi family.
+
+    Accepts every prefix the canvas + openclaw docs use for this vendor:
+      - `moonshot:<id>`     — adapter_base.resolve_provider_routing prefix
+      - `kimi:<id>`         — alt prefix some templates write
+      - `kimi-coding:<id>`  — workspace-server's deriveProvider for `kimi-coding/*`
+      - `kimi-coding/<id>`  — bare slug used by the canvas Model dropdown
+      - `kimi-<id>` / `moonshot-<id>` — bare-id forms from docs / picker
+    Case-insensitive on the bare prefix to tolerate canvas-vs-docs casing
+    drift (canvas writes `kimi-k2`, docs write `Kimi-k2.6`).
+    """
+    if not model:
+        return False
+    m = model.lower()
+    return (
+        m.startswith("moonshot:")
+        or m.startswith("moonshot-")
+        or m.startswith("moonshot/")
+        or m.startswith("kimi:")
+        or m.startswith("kimi-")
+        or m.startswith("kimi/")
+        or m.startswith("kimi-coding:")
+        or m.startswith("kimi-coding/")
+    )
+
+
 def _is_token_plan_key(api_key: str | None) -> bool:
     """True if `api_key` matches MiniMax's `sk-cp-*` token-plan shape."""
     return bool(api_key) and bool(MINIMAX_TOKEN_PLAN_KEY_RE.match(api_key))
+
+
+def _is_kimi_coding_key(api_key: str | None) -> bool:
+    """True if `api_key` matches Kimi-For-Coding's `sk-kimi-*` shape.
+
+    Keys minted at platform.kimi.ai/console/api-keys carry this prefix;
+    legacy api.moonshot.ai keys carry bare `sk-*` and route through the
+    OpenAI-compat path instead.
+    """
+    return bool(api_key) and bool(KIMI_CODING_KEY_RE.match(api_key))
 
 
 def _probe_minimax_anthropic_endpoint(api_key: str, model: str) -> tuple[int, str]:
@@ -104,6 +189,47 @@ def _probe_minimax_anthropic_endpoint(api_key: str, model: str) -> tuple[int, st
             "anthropic-version": "2023-06-01",
             "x-api-key": api_key,
             "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.read(200).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(200).decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, repr(e)
+
+
+def _probe_kimi_coding_anthropic_endpoint(api_key: str, model: str) -> tuple[int, str]:
+    """Send a 1-token messages request to the Kimi-For-Coding gateway.
+
+    Same shape + intent as the MiniMax probe: surface auth failures
+    BEFORE the long gateway cold-start so the user sees a clear setup
+    error instead of a confusing in-chat 401.
+
+    The Kimi-For-Coding gateway rejects non-coding-agent User-Agents
+    with 403 (`access_terminated_error`). We use `claude-cli/...`
+    because that's the UA openclaw's Anthropic SDK shim sends on every
+    real request — probing with the same UA proves end-to-end
+    reachability, not just network-level auth.
+    """
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ok"}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{KIMI_CODING_ANTHROPIC_BASE_URL}/v1/messages",
+        data=body,
+        method="POST",
+        headers={
+            "anthropic-version": "2023-06-01",
+            "x-api-key": api_key,
+            "content-type": "application/json",
+            # Kimi-For-Coding UA gate: openclaw's runtime UA is
+            # `claude-cli/<version>` (Anthropic SDK default). Match it
+            # so probe parity matches steady-state.
+            "user-agent": "claude-cli/1.0.30 (openclaw-adapter, setup-probe)",
         },
     )
     try:
@@ -188,20 +314,35 @@ class OpenClawAdapter(BaseAdapter):
             config.model, os.environ, registry=OPENCLAW_PROVIDERS, runtime_config=config.runtime_config
         )
 
-        # 2b. Detect MiniMax token-plan (`sk-cp-*`) routing.
+        # 2b. Detect Anthropic-compat upstream routing for vendors that
+        # ship a Molecule-CP-style proxy token (`sk-cp-*` for MiniMax,
+        # `sk-kimi-*` for Kimi For Coding).
         #
-        # If the configured model is MiniMax-family AND the resolved key
-        # is a token-plan key, override the upstream surface to MiniMax's
+        # If the configured model + key shape match one of these vendor
+        # contracts, override the upstream surface to the vendor's
         # Anthropic-compatible gateway. The Anthropic SDK shim inside
         # openclaw picks up ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
         # from the environment on every request, so we don't need (and
         # don't want) the `openclaw onboard --custom-base-url` flag —
-        # that wires the OpenAI-compat client, which is the wrong shape.
-        # See module-level docstring for the upstream MiniMax docs links
-        # and the env-var contract this implements.
+        # that wires the OpenAI-compat client, which is the wrong shape
+        # for either of these vendors' proxy tokens.
+        # See the module-level docstrings (`MINIMAX_*` and `KIMI_*`)
+        # for the upstream docs links and the env-var contract.
+        #
+        # The two routes are mutually exclusive (a key matches at most
+        # one prefix). We compute both flags so the rest of setup() can
+        # branch on either without re-running the prefix checks.
         use_minimax_token_plan = (
             _is_minimax_model(model) and _is_token_plan_key(api_key)
         )
+        use_kimi_coding = (
+            _is_kimi_model(model) and _is_kimi_coding_key(api_key)
+        )
+        # Shared flag — set when ANY Anthropic-compat-via-env route is
+        # active. Used by the onboard + post-onboard config patches
+        # below so we don't duplicate branch logic per vendor.
+        use_anthropic_env_route = use_minimax_token_plan or use_kimi_coding
+
         if use_minimax_token_plan:
             # Pin the model name to what MiniMax's Anthropic gateway
             # actually serves. The token-plan endpoint only recognises a
@@ -258,18 +399,99 @@ class OpenClawAdapter(BaseAdapter):
                     MINIMAX_ANTHROPIC_BASE_URL, status,
                 )
 
+        if use_kimi_coding:
+            # Pin the model name to what the Kimi-For-Coding gateway
+            # actually serves. Probed live 2026-05-15:
+            # `GET /coding/v1/models` returns exactly one entry,
+            # `kimi-for-coding`. The raw canvas value carries shapes
+            # like `moonshot:kimi-k2` / `kimi-coding/kimi-k2` /
+            # `kimi-k2.6` — none of which the gateway recognises; it
+            # 404s on unknown ids. Caller can override via
+            # runtime_config.anthropic_model once Moonshot ships a
+            # multi-model coding tier.
+            kc_model = (
+                config.runtime_config.get("anthropic_model")
+                or KIMI_CODING_MODEL
+            )
+            kc_env = {
+                "ANTHROPIC_BASE_URL": KIMI_CODING_ANTHROPIC_BASE_URL,
+                "ANTHROPIC_AUTH_TOKEN": api_key,
+                # 50 min — matches the MiniMax path; openclaw long
+                # tool-chains on Kimi K2.6 can run multi-minute synth.
+                "API_TIMEOUT_MS": "3000000",
+                # Don't leak telemetry/anon-id pings to anthropic.com.
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "ANTHROPIC_MODEL": kc_model,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": kc_model,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": kc_model,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": kc_model,
+                # Match the platform.kimi.ai docs' recommended subagent
+                # routing — keeps sub-agent calls on the same gateway
+                # rather than falling back to api.anthropic.com.
+                "CLAUDE_CODE_SUBAGENT_MODEL": kc_model,
+            }
+            os.environ.update(kc_env)
+            logger.info(
+                "Kimi-For-Coding (sk-kimi-*) detected for model=%s; "
+                "routing via Anthropic gateway %s (model=%s)",
+                model, KIMI_CODING_ANTHROPIC_BASE_URL, kc_model,
+            )
+
+            # Fail fast: probe the endpoint with the resolved key BEFORE
+            # spawning the gateway. A 401 here means the token is
+            # invalid; surfacing that as a setup failure beats waiting
+            # ~7 min for cold-start + a confusing in-chat error.
+            # A 403 (UA gate) is treated as auth-OK because openclaw's
+            # runtime UA is `claude-cli/...` which the probe already
+            # matches — anything other than 401 confirms the network
+            # path + token are valid.
+            status, body_head = _probe_kimi_coding_anthropic_endpoint(api_key, kc_model)
+            if status == 401:
+                raise RuntimeError(
+                    f"Kimi-For-Coding probe returned 401 (auth failure). "
+                    f"The configured KIMI_API_KEY is invalid for the "
+                    f"Anthropic-compat surface at {KIMI_CODING_ANTHROPIC_BASE_URL}. "
+                    f"Mint a new key at https://platform.kimi.ai/console/api-keys. "
+                    f"Response: {body_head[:200]}"
+                )
+            if status == 403:
+                # Should not happen — our probe sends `claude-cli/*`
+                # which the gateway accepts. If it does, Moonshot has
+                # tightened the UA gate; surface the error so we don't
+                # silently boot a workspace that 403s on every turn.
+                raise RuntimeError(
+                    f"Kimi-For-Coding probe returned 403 from "
+                    f"{KIMI_CODING_ANTHROPIC_BASE_URL} despite a coding-agent "
+                    f"User-Agent. Moonshot may have changed the UA gate; "
+                    f"check platform.kimi.ai release notes. Response: {body_head[:200]}"
+                )
+            if status == 0:
+                # Network failure — log and continue. The gateway will
+                # retry on its own once the workspace has connectivity.
+                logger.warning(
+                    "Kimi-For-Coding probe could not reach %s: %s. "
+                    "Continuing setup; openclaw will retry on first agent call.",
+                    KIMI_CODING_ANTHROPIC_BASE_URL, body_head,
+                )
+            else:
+                logger.info(
+                    "Kimi-For-Coding probe to %s returned HTTP %d (non-401 = auth OK).",
+                    KIMI_CODING_ANTHROPIC_BASE_URL, status,
+                )
+
         # 3. Run non-interactive onboard.
         #
-        # For the MiniMax token-plan path we still run onboard so the
-        # local openclaw state dir is initialised (paired.json, devices,
-        # etc.), but we DO NOT pass --custom-base-url / --custom-model-id
-        # / --custom-compatibility — those wire the OpenAI-compat
-        # client and would override the Anthropic SDK shim's env-var
-        # routing. Onboard runs with the env vars already in scope so
-        # the shim picks them up for any onboard-time probes too.
+        # For the Anthropic-env routes (MiniMax token-plan, Kimi For
+        # Coding) we still run onboard so the local openclaw state dir
+        # is initialised (paired.json, devices, etc.), but we DO NOT
+        # pass --custom-base-url / --custom-model-id /
+        # --custom-compatibility — those wire the OpenAI-compat client
+        # and would override the Anthropic SDK shim's env-var routing.
+        # Onboard runs with the env vars already in scope so the shim
+        # picks them up for any onboard-time probes too.
         if not os.path.exists(os.path.expanduser("~/.openclaw/openclaw.json")):
             logger.info(f"Running OpenClaw onboard (model: {model})...")
-            if use_minimax_token_plan:
+            if use_anthropic_env_route:
                 onboard_cmd = [
                     "openclaw", "onboard", "--non-interactive",
                     "--auth-choice", "anthropic-env",
@@ -295,11 +517,12 @@ class OpenClawAdapter(BaseAdapter):
             logger.info("OpenClaw onboard complete")
 
         # 3b. Fix context window (OpenClaw defaults to 16K, but modern models have much more).
-        # Skip on the MiniMax token-plan path — the Anthropic SDK shim
-        # doesn't read openclaw's per-provider model registry; context
-        # window is determined by the upstream model card at MiniMax.
+        # Skip on every Anthropic-env path (MiniMax token-plan, Kimi For
+        # Coding) — the Anthropic SDK shim doesn't read openclaw's
+        # per-provider model registry; context window is determined by
+        # the upstream model card at the gateway.
         oc_config_path = os.path.expanduser("~/.openclaw/openclaw.json")
-        if os.path.exists(oc_config_path) and not use_minimax_token_plan:
+        if os.path.exists(oc_config_path) and not use_anthropic_env_route:
             try:
                 import json as json_mod
                 oc_cfg = json_mod.load(open(oc_config_path))
@@ -316,11 +539,12 @@ class OpenClawAdapter(BaseAdapter):
 
         # 3c. Always write auth-profiles.json
         # (key may have been set via secrets API after first boot).
-        # Skip on the MiniMax token-plan path — auth flows entirely
-        # through ANTHROPIC_AUTH_TOKEN, not openclaw's per-provider
-        # api-key registry. Writing the wrong-shape entry here would
-        # confuse openclaw's provider picker at next boot.
-        if api_key and not use_minimax_token_plan:
+        # Skip on every Anthropic-env path (MiniMax token-plan, Kimi
+        # For Coding) — auth flows entirely through ANTHROPIC_AUTH_TOKEN,
+        # not openclaw's per-provider api-key registry. Writing the
+        # wrong-shape entry here would confuse openclaw's provider
+        # picker at next boot.
+        if api_key and not use_anthropic_env_route:
             auth_dir = os.path.expanduser("~/.openclaw/agents/main/agent")
             os.makedirs(auth_dir, exist_ok=True)
             auth_file = os.path.join(auth_dir, "auth-profiles.json")
