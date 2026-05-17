@@ -15,6 +15,22 @@ name: CI
 
 on: [push, pull_request]
 
+# Defense-in-depth de-dup ONLY (the t4-conformance per-run-unique
+# tag/name fix below is the actual fail-closed primitive against the
+# shared-host-daemon race; see that job). Scope per workflow + ref +
+# EVENT so the push run and the pull_request run of the same internal-PR
+# commit get DISTINCT groups — they must BOTH complete (each emits its
+# own required-status context;
+# feedback_gitea_gate_check_required_list_not_combined_status). Never
+# per-SHA-global: that silently cross-cancels legit required checks
+# (feedback_concurrency_group_per_sha). cancel-in-progress:false so an
+# in-flight live T4 probe is never aborted mid-assertion (a cancelled
+# privileged probe would look like a gate failure / flake); a newer push
+# to the same ref+event simply queues behind it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
 
@@ -149,7 +165,30 @@ jobs:
             echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
             exit 1
           fi
-          docker build -t t4-conformance-test . --no-cache 2>&1 | tail -5
+          # Per-run-unique image tag + container name. This repo triggers
+          # `on: [push, pull_request]`, so a single push to an internal PR
+          # branch fires BOTH a `push` run AND a `pull_request` run for the
+          # SAME commit. The runners share one host Docker daemon
+          # (--network host + /var/run/docker.sock bind), so a STATIC
+          # `-t t4-conformance-test` / `--name t4probe` collides across the
+          # two concurrent same-commit runs: whichever event creates the
+          # container first wins, the other dies with
+          #   "docker: Error response from daemon: Conflict. The container
+          #    name "/t4probe" is already in use ..." (exit 125)
+          # — a FALSE NEGATIVE (the probe never runs; the build that wins
+          # the race passes all assertions). Scope every host-daemon object
+          # to GITHUB_RUN_ID + GITHUB_RUN_ATTEMPT so push and pull_request
+          # runs of the same SHA are isolated. This does NOT weaken the
+          # gate — the same privileged container, the same agent-owned
+          # token + host-root assertions still run, just under
+          # collision-proof names. (RFC internal#456 §11;
+          # feedback_concurrency_group_per_sha — unique-name is the
+          # fail-closed primitive, concurrency is only de-dup.)
+          # Deterministic function of run-id/attempt — recomputed
+          # identically in the next step (no cross-step $GITHUB_ENV
+          # round-trip, which can be fragile under act_runner).
+          T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          docker build -t "$T4_TAG" . --no-cache 2>&1 | tail -5
       - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND token agent-ownership
         run: |
           set -euo pipefail
@@ -158,25 +197,39 @@ jobs:
           # wants a live workspace; we only need the container up long
           # enough to probe, so override the command with a sleep and
           # exercise the agent context directly.
+          # Per-run-unique container name (see Build step rationale): the
+          # shared host Docker daemon is concurrently used by the SAME
+          # commit's push + pull_request runs. A static name collides and
+          # false-negatives. T4_PROBE is unique per run-id/attempt.
+          # Recompute the SAME deterministic tag the build step used
+          # (pure function of run-id/attempt — no cross-step env reliance).
+          T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          T4_PROBE="t4probe-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          # Defensive pre-removal of a LEAKED container from a crashed
+          # prior attempt of THIS SAME run-id only (the name is run-id
+          # scoped, so this can never reap a concurrent foreign run's
+          # probe). This is cleanup of our own debris, NOT a gate bypass —
+          # no `|| true` on the real assertions below; failure still fails.
+          docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true
           CID=$(docker run -d \
-            --name t4probe \
+            --name "$T4_PROBE" \
             --network host \
             --privileged \
             --pid=host \
             -v /:/host \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --entrypoint /bin/sh \
-            t4-conformance-test -c 'sleep 600')
-          trap 'docker rm -f t4probe >/dev/null 2>&1 || true' EXIT
+            "$T4_TAG" -c 'sleep 600')
+          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
 
           echo "=== Reproduce the agent-owned-token half of the entrypoint contract ==="
           # The real entrypoint chowns /configs to agent before gosu;
           # /configs is an unmounted VOLUME in this probe, so reproduce
           # the exact contract step the entrypoint performs, then assert.
-          docker exec t4probe sh -c 'mkdir -p /configs && touch /configs/.auth_token && chown -R agent:agent /configs'
+          docker exec "$T4_PROBE" sh -c 'mkdir -p /configs && touch /configs/.auth_token && chown -R agent:agent /configs'
 
           echo "=== (b) token agent-ownership: stat /configs/.auth_token ==="
-          OWNER_UID=$(docker exec t4probe stat -c '%u' /configs/.auth_token)
+          OWNER_UID=$(docker exec "$T4_PROBE" stat -c '%u' /configs/.auth_token)
           echo "owner_uid=$OWNER_UID"
           if [ "$OWNER_UID" != "1000" ]; then
             echo "::error::T4 contract violated: /configs/.auth_token owner_uid=$OWNER_UID (expected 1000). Escalation leg must NOT regress agent-readable token (RFC internal#456 §10, OpenClaw list_peers root==root accident / Hermes list_peers-401 class)."
@@ -185,7 +238,7 @@ jobs:
 
           echo "=== (a) host-root reach AS THE uid-1000 AGENT (not root) ==="
           # Run as the agent user (uid 1000), exactly as gosu would.
-          AGENT_HOSTROOT_UID=$(docker exec -u agent t4probe sudo -n nsenter --target 1 --mount --pid -- id -u)
+          AGENT_HOSTROOT_UID=$(docker exec -u agent "$T4_PROBE" sudo -n nsenter --target 1 --mount --pid -- id -u)
           echo "agent->host-root id -u = $AGENT_HOSTROOT_UID"
           if [ "$AGENT_HOSTROOT_UID" != "0" ]; then
             echo "::error::T4 contract violated: uid-1000 agent could NOT attain host root via 'sudo nsenter --target 1' (got uid=$AGENT_HOSTROOT_UID). T4 escalation leg ABSENT/broken."
@@ -193,11 +246,18 @@ jobs:
           fi
           # Defense-in-depth: host-filesystem write+readback through /host
           # from the agent, proving real host reach (not just a namespace
-          # trick on an isolated PID 1).
+          # trick on an isolated PID 1). The probe file path is ALSO
+          # per-run-unique: /host maps to the SHARED host /, so a static
+          # /host/tmp/.t4-conformance-probe would let the concurrent
+          # same-commit push+pull_request runs clobber/rm each other's
+          # marker mid-readback (a second false-negative of the same
+          # class). Run-id scoping keeps each run asserting exactly the
+          # marker it wrote — still fully fail-closed.
+          PROBE_FILE="/host/tmp/.t4-conformance-probe-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           MARKER="t4-conformance-$(date +%s)-$RANDOM"
-          docker exec -u agent t4probe sudo -n sh -c "echo $MARKER > /host/tmp/.t4-conformance-probe"
-          READBACK=$(docker exec -u agent t4probe sudo -n cat /host/tmp/.t4-conformance-probe)
-          docker exec -u agent t4probe sudo -n rm -f /host/tmp/.t4-conformance-probe
+          docker exec -u agent "$T4_PROBE" sudo -n sh -c "echo $MARKER > $PROBE_FILE"
+          READBACK=$(docker exec -u agent "$T4_PROBE" sudo -n cat "$PROBE_FILE")
+          docker exec -u agent "$T4_PROBE" sudo -n rm -f "$PROBE_FILE"
           if [ "$READBACK" != "$MARKER" ]; then
             echo "::error::T4 host-fs write+readback through /host failed (got '$READBACK' expected '$MARKER')."
             exit 1
