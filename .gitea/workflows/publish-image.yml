@@ -65,7 +65,18 @@ jobs:
 
   publish:
     name: Build & push workspace-template-openclaw image
-    runs-on: ubuntu-latest
+    # internal#512: pin to the dedicated Linux publish runners (label
+    # "publish" → molecule-runner-publish-1/2). MUST NOT use `ubuntu-latest`:
+    # that label is also advertised by the Windows/WSL self-hosted runners
+    # (hongming-pc-runner-*), so this docker build/push job lands
+    # non-deterministically on a Windows runner where `aws ecr
+    # get-login-password | docker login --password-stdin` fails with
+    # "Failed to initialize: protocol not available" and the image never
+    # publishes. Placement-dependent, NOT a transient flake. Mirrors the
+    # molecule-core convention (publish-workspace-server-image.yml /
+    # publish-runtime.yml / publish-canvas-image.yml: `runs-on: publish`)
+    # and the codex sibling fix (PR#9).
+    runs-on: publish
     timeout-minutes: 30
     needs: resolve-version
     steps:
