@@ -87,7 +87,13 @@ jobs:
 
   validate-runtime:
     name: Template validation (runtime)
-    runs-on: ubuntu-latest
+    # internal#512 follow-on (class defect): pin to `docker-host` so this
+    # job (which `docker build`s the template image) lands on the Linux
+    # operator-host runners. The bare `ubuntu-latest` label is also
+    # advertised by hongming-pc-runner-* (Windows act_runner v1.0.3),
+    # where `docker build` fails non-deterministically. Mirror of the
+    # codex sibling fix (template-codex#9) and internal#512.
+    runs-on: docker-host
     timeout-minutes: 15
     needs: validate-static
     if: needs.validate-static.result == 'success'
@@ -134,7 +140,14 @@ jobs:
   # guards the runtime side.
   t4-conformance:
     name: T4 tier-4 conformance (live)
-    runs-on: ubuntu-latest
+    # internal#512 follow-on (class defect): pin to `docker-host` so the
+    # T4 live probe (`docker build` + `docker run -d` + privileged
+    # `docker exec ... sudo -n nsenter --target 1 ...`) lands on the
+    # Linux operator-host runners. The bare `ubuntu-latest` label is
+    # also advertised by hongming-pc-runner-* (Windows act_runner v1.0.3)
+    # where the privileged docker exec chain cannot work. Mirror of
+    # template-codex#9 and internal#512.
+    runs-on: docker-host
     timeout-minutes: 15
     needs: validate-static
     # Untrusted-by-design: builds + runs the PR's Dockerfile. Skip on
