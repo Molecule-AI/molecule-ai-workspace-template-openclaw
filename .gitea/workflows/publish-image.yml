@@ -173,6 +173,7 @@ jobs:
           echo "::notice::${IMAGE}: all /app/*.py modules import cleanly"
 
       - name: Push image to ECR (post-smoke)
+        id: push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
@@ -188,3 +189,55 @@ jobs:
             org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI workspace template — openclaw runtime
+
+  promote-pin:
+    # RFC internal#529 Layer A — auto-promote the just-pushed digest to
+    # runtime_image_pins via the control-plane admin endpoint. Gitea 1.22.6
+    # has no `workflow_run`, so promotion has to be a job in this same
+    # workflow (cannot be a separate workflow listening on publish-image
+    # success). Read-only on `if: success()` so a failed publish (smoke
+    # test red, push red) never bumps the pin.
+    name: Promote runtime_image_pins (CP admin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [resolve-version, publish]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+    steps:
+      - name: POST /cp/admin/runtime-image/promote
+        env:
+          CP_ADMIN_API_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+          TEMPLATE_NAME: openclaw
+          IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+          GIT_SHA: ${{ needs.resolve-version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CP_ADMIN_API_TOKEN}" ]; then
+            echo "::error::CP_ADMIN_API_TOKEN secret not configured on this repo"
+            exit 1
+          fi
+          if [ -z "${IMAGE_DIGEST}" ]; then
+            echo "::error::needs.publish.outputs.digest is empty — Push step did not expose digest"
+            exit 1
+          fi
+          body=$(printf '{"template_name":"%s","image_digest":"%s","git_sha":"%s","notes":"auto-promote via publish-image.yml @ %s"}' \
+            "${TEMPLATE_NAME}" "${IMAGE_DIGEST}" "${GIT_SHA}" "${GITHUB_SHA}")
+          echo "::notice::POST runtime-image/promote template=${TEMPLATE_NAME} digest=${IMAGE_DIGEST} git_sha=${GIT_SHA}"
+          # Capture body + status separately; fail-loud on non-2xx so a
+          # silent 4xx never strands the pin behind a green workflow.
+          resp=$(mktemp)
+          code=$(curl -sS -o "${resp}" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${CP_ADMIN_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "${body}" \
+            https://api.moleculesai.app/cp/admin/runtime-image/promote)
+          echo "HTTP ${code}"
+          cat "${resp}"
+          echo
+          if [ "${code}" != "200" ] && [ "${code}" != "201" ]; then
+            echo "::error::promote failed (HTTP ${code})"
+            exit 1
+          fi
+          echo "::notice::runtime_image_pins.${TEMPLATE_NAME} bumped to ${IMAGE_DIGEST}"
