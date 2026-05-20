@@ -694,6 +694,21 @@ class OpenClawA2AExecutor(AgentExecutor):
 
         await set_current_task(self._heartbeat, brief_task(user_message))
 
+        # Derive a STABLE session id for openclaw's native SessionManager
+        # (pi-embedded-runner/run/attempt.ts:1655). Per RFC #600
+        # (https://git.moleculesai.app/molecule-ai/internal/issues/600):
+        # the platform must NOT ship message history; the agent owns the
+        # session by its own key. a2a-sdk semantics: context_id is the
+        # cross-turn conversation key (stable across messages in the same
+        # chat); task_id changes per task — so using task_id resets the
+        # openclaw session every turn, defeating native continuity.
+        # Fall back to task_id only if context_id is unset (legacy clients).
+        session_id = (
+            getattr(context, "context_id", None)
+            or getattr(context, "task_id", None)
+            or "default"
+        )
+
         # Call OpenClaw agent via CLI, retrying once if we hit the
         # scope-upgrade-pending gate. The priming step in setup() should
         # cover steady-state, but openclaw can re-request scopes after
@@ -706,7 +721,7 @@ class OpenClawA2AExecutor(AgentExecutor):
             for attempt in range(2):
                 proc = await asyncio.create_subprocess_exec(
                     "openclaw", "agent",
-                    "--session-id", context.task_id or "default",
+                    "--session-id", session_id,
                     "--message", user_message,
                     "--json", "--timeout", "120",
                     stdout=asyncio.subprocess.PIPE,
